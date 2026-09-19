@@ -31,7 +31,6 @@ def upstream(request: httpx.Request) -> httpx.Response:
     if request.url.path == "/oauth2/v2/access_token/":
         assert request.headers["authorization"] == "Bearer test-xingzhe:test-upstream-secret"
         assert "multipart/form-data" in request.headers["content-type"]
-        assert b'name="scope"' in request.content
         return httpx.Response(
             200,
             json={

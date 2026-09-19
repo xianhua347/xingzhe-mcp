@@ -113,7 +113,7 @@ class Xingzhe:
                     + ":"
                     + self.settings.xingzhe_client_secret.get_secret_value()
                 },
-                files={key: (None, value) for key, value in {**fields, "scope": scope}.items()},
+                files={key: (None, value) for key, value in fields.items()},
             )
             data = self._response(response)
             expiry = data.get("expires_at")
