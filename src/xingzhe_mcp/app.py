@@ -102,13 +102,15 @@ def create_app(
         readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
     )
 
+    read_meta = {"securitySchemes": [{"type": "oauth2", "scopes": [SCOPE]}]}
+
     def mcp_subject() -> str:
         access = get_access_token()
         if access is None or not access.subject:
             raise ToolError("Authentication is required. Reconnect your MCP client.")
         return access.subject
 
-    @mcp.tool(annotations=annotations, meta={"openai/profile": True})
+    @mcp.tool(annotations=annotations, meta={**read_meta, "openai/profile": True})
     async def get_profile() -> ProfileResult:
         """Return the authenticated Xingzhe account's stable ID and current display name."""
         try:
@@ -125,7 +127,7 @@ def create_app(
                 "Authorization storage is unavailable. Contact the service owner."
             ) from None
 
-    @mcp.tool(annotations=annotations)
+    @mcp.tool(annotations=annotations, meta=read_meta)
     async def list_activities(
         limit: Annotated[int, Query(ge=1, le=100)] = 20,
         offset: Annotated[int, Query(ge=0)] = 0,
@@ -144,7 +146,7 @@ def create_app(
                 "Authorization storage is unavailable. Contact the service owner."
             ) from None
 
-    @mcp.tool(annotations=annotations)
+    @mcp.tool(annotations=annotations, meta=read_meta)
     async def get_activity(activity_id: Annotated[int, Query(gt=0)]) -> Activity:
         """Get activity details including cadence, heart rate and power when supplied by Xingzhe."""
         try:
@@ -166,7 +168,7 @@ def create_app(
                 "Authorization storage is unavailable. Contact the service owner."
             ) from None
 
-    @mcp.tool(annotations=annotations)
+    @mcp.tool(annotations=annotations, meta=read_meta)
     async def list_my_routes(
         limit: Annotated[int, Query(ge=1, le=20)] = 20,
         offset: Annotated[int, Query(ge=0)] = 0,
@@ -174,7 +176,7 @@ def create_app(
         """List routes created by the authenticated account. Page using next_offset."""
         return await checked(xingzhe.list_routes(mcp_subject(), "mine", limit, offset))
 
-    @mcp.tool(annotations=annotations)
+    @mcp.tool(annotations=annotations, meta=read_meta)
     async def list_collected_routes(
         limit: Annotated[int, Query(ge=1, le=20)] = 20,
         offset: Annotated[int, Query(ge=0)] = 0,
@@ -182,7 +184,7 @@ def create_app(
         """List routes collected by the authenticated account, including shared routes."""
         return await checked(xingzhe.list_routes(mcp_subject(), "collects", limit, offset))
 
-    @mcp.tool(annotations=annotations)
+    @mcp.tool(annotations=annotations, meta=read_meta)
     async def get_route(route_id: Annotated[int, Query(gt=0)]) -> dict[str, Any]:
         """Read route navigation JSON, including elevation, turns and waypoints when supplied.
 
@@ -191,12 +193,12 @@ def create_app(
         """
         return await checked(xingzhe.get_route(mcp_subject(), route_id))
 
-    @mcp.tool(annotations=annotations)
+    @mcp.tool(annotations=annotations, meta=read_meta)
     async def get_route_gpx(route_id: Annotated[int, Query(gt=0)]) -> RouteGPX:
         """Read a route's GPX as UTF-8 text, up to 1,000,000 bytes. No download URL is exposed."""
         return await checked(xingzhe.get_route_gpx(mcp_subject(), route_id))
 
-    @mcp.tool(annotations=annotations)
+    @mcp.tool(annotations=annotations, meta=read_meta)
     async def list_uploads(
         limit: Annotated[int, Query(ge=1, le=20)] = 20,
         offset: Annotated[int, Query(ge=0)] = 0,
