@@ -170,7 +170,8 @@ def create_app(
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Content-Security-Policy"] = (
-            "default-src 'none'; frame-ancestors 'none'; form-action 'self'"
+            "default-src 'none'; frame-ancestors 'none'; "
+            "form-action 'self' https://www.imxingzhe.com"
         )
         return response
 
