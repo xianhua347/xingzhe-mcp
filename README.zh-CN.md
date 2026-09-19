@@ -2,48 +2,82 @@
 
 [English](README.md) · 简体中文
 
-一个开源项目，旨在通过 Model Context Protocol 将你的[行者](https://www.imxingzhe.com/)骑行数据接入 AI 助手。
+让 AI 助手读取你的[行者](https://www.imxingzhe.com/)骑行记录。查询运动、回顾骑行，并在数据可用时比较踏频、心率和功率。
 
-使用 Python 和 FastAPI 构建，采用 uv 管理，面向自托管使用。
+Python · FastAPI · MCP · Supabase · Vercel，使用 [uv](https://docs.astral.sh/uv/) 管理项目。
 
 ## 为什么做这个项目？
 
-骑行记录已经在行者里了。我们希望这些数据也能用于对话：复盘一次骑行、比较几次骑行的踏频，或者回顾一个月的骑行情况。
+骑行记录已经保存在中国大陆行者 App 中。这个服务通过官方 API 读取记录，提供两个只读 MCP 工具。每个部署连接一个行者账号，使用自己的凭证和数据库。
 
-项目面向中国大陆行者 App，使用官方 API。保持服务简单，使用自己的账号，让部署和参与开发都更容易。
+| 工具 | 用途 |
+| --- | --- |
+| `list_activities` | 分页查询运动记录，可指定开始和结束时间戳。 |
+| `get_activity` | 获取单次运动详情，包括行者提供的传感器汇总数据。 |
+
+查询时间使用 Unix 毫秒时间戳，距离单位为米，时长单位为秒。其他字段保留上游原值，不推测缺失的测量值。运动 API 不提供逐秒踏频序列或 FIT 文件下载。
 
 ## 快速开始
 
-安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)，然后在仓库根目录运行：
+需要一个[行者开发者应用](https://www.imxingzhe.com/home/#/settings/api)、一个 Supabase 项目，以及支持配置 OAuth 客户端 ID 和密钥的 MCP 客户端。
 
 ```sh
 uv sync --locked
-uv run uvicorn app:app --reload
+cp .env.example .env
 ```
 
-uv 会安装项目指定的 Python 版本和依赖。打开 [localhost:8000/docs](http://localhost:8000/docs) 查看 HTTP API，或访问 [/health](http://localhost:8000/health) 确认服务已启动。
+1. 在 Supabase SQL 编辑器中执行一次 [`supabase/migrations/`](supabase/migrations/) 中的 SQL，或通过现有迁移流程应用。它会创建私有的 `xingzhe` schema。
+2. 填写 `.env`。从 Supabase 的 Connect 面板复制 **Transaction pooler** 连接串作为 `DATABASE_URL`，启用 `sslmode=require`，保留面板中的实际连接池域名。也支持 Vercel 集成注入的 `POSTGRES_URL`。
+3. 按 [`.env.example`](.env.example) 中的命令，分别生成 `ENCRYPTION_KEY`、`ADMIN_KEY` 和 `MCP_CLIENT_SECRET`。重新部署时保留原加密密钥。
+4. 将行者应用的回调地址设置为 `PUBLIC_URL/oauth/xingzhe/callback`。本地开发时为 `http://localhost:8000/oauth/xingzhe/callback`。
+5. 将 MCP 客户端提供的精确回调地址填入 `MCP_REDIRECT_URIS`，格式为 JSON 数组。这与行者回调地址不同，不接受通配符。
+
+```sh
+uv run uvicorn app:app --reload --no-access-log
+```
+
+打开 [localhost:8000/connect](http://localhost:8000/connect)，输入 `ADMIN_KEY` 并授权行者。然后在 MCP 客户端添加 `PUBLIC_URL/mcp`，填写 `MCP_CLIENT_ID` 和 `MCP_CLIENT_SECRET`。授权页面会要求输入服务所有者密钥，再允许客户端读取运动记录。
+
+在 ChatGPT 中使用带 OAuth 的自定义 MCP 应用，填写上述客户端凭证，并把它提供的精确回调地址写入 `MCP_REDIRECT_URIS`。功能可用范围与配置方法参见 [OpenAI 授权文档](https://developers.openai.com/apps-sdk/build/auth)。
+
+## 部署到 Vercel
+
+将仓库导入 Vercel，选择 FastAPI 框架预设。[`app.py`](app.py) 是入口，[`vercel.json`](vercel.json) 配置函数。依赖声明在 `pyproject.toml`，版本锁定在 `uv.lock`。
+
+将 Supabase 集成关联到这个 Vercel 项目，并将 `.env.example` 中的变量配置为服务端环境变量。如果集成已注入 `POSTGRES_URL`，可以不设置 `DATABASE_URL`。Supabase 的公开 API Key 不能作为数据库密码使用。
+
+将 `PUBLIC_URL` 设置为固定的 HTTPS 生产域名，更新两套授权流程的回调地址，然后重新部署。连接行者前先检查 `/ready`。MCP 客户端必须能直接访问 OAuth 元数据和 `/mcp`，不能被 Vercel 登录保护拦截；运动数据由应用自身的 OAuth 保护。
+
+MCP 使用无状态 Streamable HTTP。授权状态和加密令牌保存在 Supabase，后续请求可以由不同 Vercel 实例处理。如果在预览部署中启用 OAuth，请使用独立数据库和加密密钥。
+
+## 访问与存储
+
+服务只申请行者的 `read` 权限。MCP 使用独立的 OAuth 流程，支持 PKCE、短期访问令牌、刷新令牌轮换和所有者明确授权。行者凭证与令牌不会返回给 MCP 客户端。
+
+私有表启用 RLS，不设置公开访问策略。服务通过 PostgreSQL 访问它，不使用 Supabase Data API。Supabase 可能提示“已启用 RLS，但没有策略”，这是阻止 Data API 访问的预期配置。不要将 `xingzhe` 加入公开 schema 列表。
+
+访问 `/disconnect` 可删除保存的授权，并撤销全部 MCP 授权；重新连接也会撤销旧授权。若要撤销行者平台上的应用授权，请在行者账号设置中操作。丢失或替换 `ENCRYPTION_KEY` 会导致现有记录无法解密，请将它与数据库分别备份。
+
+`GET /health` 检查进程是否运行，`GET /ready` 检查配置和存储。配置缺失或无效时，业务路由返回 503。REST 接口为 `/api/activities` 和 `/api/activities/{id}`，同样需要有效的 MCP 访问令牌。日志中应避免记录授权请求头和回调地址的查询参数。
 
 ## 开发
-
-代码统一使用 Python 类型注解。mypy 以严格模式检查类型，Ruff 负责代码检查和格式化，pytest 运行测试。
 
 ```sh
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy
 uv run pytest
+uv build
 ```
 
-应用代码位于 [`src/xingzhe_mcp/`](src/xingzhe_mcp/)。根目录的 [`app.py`](app.py) 导出 FastAPI 应用，供 Uvicorn 和 [Vercel](https://vercel.com/docs/frameworks/backend/fastapi) 使用。
+PostgreSQL 集成测试覆盖 OAuth、MCP 调用、持久化、加密和并发令牌交换。将 `TEST_DATABASE_URL` 指向数据库名以 `_test` 结尾的独立测试库，测试会重建其中的 `xingzhe` schema。未设置该变量时跳过数据库测试。CI 会启动 PostgreSQL 并运行完整测试，测试中的行者外部接口使用模拟响应。
 
-使用 `uv add` 或 `uv add --dev` 添加依赖，并将更新后的 `uv.lock` 与 `pyproject.toml` 一同提交。
+应用代码位于 [`src/xingzhe_mcp/`](src/xingzhe_mcp/)。使用 `uv add` 添加依赖，将 `uv.lock` 与 `pyproject.toml` 一起提交。
 
 ## 参与贡献
 
-欢迎提交问题和 Pull Request。较大的改动请先开 Issue 讨论范围。保持改动集中，验证修改涉及的行为，并同步更新中英文 README。
-
-测试和示例请使用合成数据。不要在 Pull Request 中包含账号凭据、访问令牌或个人骑行记录。
+欢迎提交 Issue 和 Pull Request。保持修改范围集中，并同步维护中英文 README。测试使用合成数据，不要提交账号凭证或个人运动记录。
 
 ## 许可证
 
-[MIT](LICENSE)。本项目与行者官方无隶属关系。
+[MIT](LICENSE)。本项目与行者官方无关联。

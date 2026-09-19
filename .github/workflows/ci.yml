@@ -10,6 +10,21 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: test-password
+          POSTGRES_DB: xingzhe_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql://postgres:test-password@localhost:5432/xingzhe_test
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6

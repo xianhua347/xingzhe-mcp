@@ -1,13 +1,19 @@
 [project]
 name = "xingzhe-mcp"
 version = "0.1.0"
-description = "Self-hosted MCP integration for mainland Xingzhe cycling data (under development)"
+description = "Self-hosted MCP integration for mainland Xingzhe cycling data"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
+    "cryptography>=50.0.1",
     "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "mcp>=1.28,<2",
+    "psycopg[binary]>=3.2,<4",
     "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "python-multipart>=0.0.32",
     "uvicorn>=0.30",
 ]
 
@@ -17,7 +23,6 @@ build-backend = "hatchling.build"
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
     "mypy>=2.3.1",
     "pytest>=9.1.1",
     "ruff>=0.16.8",
@@ -33,6 +38,7 @@ select = ["E", "F", "I", "UP", "B"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+plugins = ["pydantic.mypy"]
 files = ["src", "app.py", "tests"]
 
 [tool.pytest.ini_options]
