@@ -71,6 +71,9 @@ def upstream(request: httpx.Request) -> httpx.Response:
 
 async def consent(client: httpx.AsyncClient, url: str) -> httpx.Response:
     page = await client.get(url)
+    if page.status_code == 303:
+        assert urlsplit(page.headers["location"]).hostname == "www.imxingzhe.com"
+        return page
     assert page.status_code == 200
     assert page.headers["referrer-policy"] == "same-origin"
     # Chromium applies form-action to the POST redirect destination as well.

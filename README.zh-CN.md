@@ -45,6 +45,8 @@ uv run uvicorn app:app --reload --no-access-log
 
 在 MCP 客户端添加 `PUBLIC_URL/mcp`，选择 OAuth。客户端会自动注册，无需填写客户端 ID、密钥或回调地址。确认申请方和返回地址后，进入行者授权，完成后自动返回 MCP 客户端。请登录与手机 App 相同的行者账号。
 
+浏览器会记住此次确认 30 天。同一客户端、回调地址和已批准权限再次连接时，直接跳转行者。新客户端、增加权限、清除 Cookie 或确认过期后，需要再次确认。如果在免确认流程中切换行者账号，请重新发起连接以确认新账号。确认记录使用加密的 HttpOnly Cookie；HTTPS 部署还启用 Secure 和仅限当前主机的 Cookie 前缀。
+
 ```text
 ChatGPT → MCP 授权 → 行者登录并确认授权
         ← MCP 授权码 ← 验证行者账户身份

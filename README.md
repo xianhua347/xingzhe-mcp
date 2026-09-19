@@ -45,6 +45,8 @@ uv run uvicorn app:app --reload --no-access-log
 
 Add `PUBLIC_URL/mcp` to your MCP client and choose OAuth. Client registration happens automatically; no client ID, secret, or callback configuration is needed. Confirm the requesting client and return address, authorize in Xingzhe, and you will return to your MCP client. Sign in with the account used in the mobile app.
 
+Your browser remembers this confirmation for 30 days. Reconnecting the same client, return address and approved scopes goes directly to Xingzhe. A new client, additional permissions, cleared cookies or expired approval requires confirmation again. If you switch Xingzhe accounts during a remembered flow, restart the connection to confirm the new account. Remembered consent uses an encrypted, HttpOnly cookie; HTTPS deployments also use Secure and a host-only cookie prefix.
+
 ```text
 ChatGPT → MCP authorization → Xingzhe login and consent
         ← MCP authorization code ← verified Xingzhe account

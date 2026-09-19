@@ -1,5 +1,6 @@
 """FastAPI and stateless Streamable HTTP MCP for local and Vercel deployments."""
 
+import json
 import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable
@@ -27,7 +28,7 @@ from starlette.routing import Route as HTTPRoute
 from xingzhe_mcp.config import Settings
 from xingzhe_mcp.files import MAX_BASE64_LENGTH, MAX_FILE_BYTES
 from xingzhe_mcp.oauth import SCOPE, SCOPES, WRITE_SCOPE, OAuthProvider
-from xingzhe_mcp.storage import Store, digest
+from xingzhe_mcp.storage import Store, Transaction, digest
 from xingzhe_mcp.xingzhe import (
     Activity,
     ActivityPage,
@@ -357,13 +358,68 @@ def create_app(
             "with OAuth. You will be redirected to Xingzhe to authorize your account.</p>"
         )
 
+    consent_lifetime = 30 * 86400
+
+    def approval_cookie(client_id: str) -> str:
+        prefix = "__Host-" if config.public_url.scheme == "https" else ""
+        return f"{prefix}xingzhe_approved_{digest(client_id)[:16]}"
+
+    async def start_authorization(
+        tx: Transaction, ticket: str, data: dict[str, Any], subject: str | None = None
+    ) -> RedirectResponse:
+        state, browser = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+        data["started"] = True
+        await tx.put("consent", ticket, data, expires_at=time.time() + 600)
+        await tx.put(
+            "state",
+            state,
+            {
+                "browser": digest(browser),
+                "ticket": ticket,
+                "upstream_scope": "write" if WRITE_SCOPE in data["scopes"] else "read",
+                "remembered_subject": subject,
+            },
+            expires_at=time.time() + 600,
+        )
+        response = RedirectResponse(
+            xingzhe.authorization_url(state, write=WRITE_SCOPE in data["scopes"]), status_code=303
+        )
+        response.delete_cookie(f"xingzhe_consent_{digest(ticket)[:16]}", path="/connect")
+        response.set_cookie(
+            f"xingzhe_oauth_{digest(state)[:16]}",
+            browser,
+            httponly=True,
+            secure=config.public_url.scheme == "https",
+            samesite="lax",
+            max_age=600,
+            path="/oauth/xingzhe/callback",
+        )
+        return response
+
     @app.get("/connect", response_class=HTMLResponse)
-    async def consent(ticket: str) -> HTMLResponse:
+    async def consent(request: Request, ticket: str) -> Response:
         browser = secrets.token_urlsafe(32)
         async with store.transaction() as tx:
             data = await tx.get("consent", ticket)
             if data is None or data.get("started"):
                 raise HTTPException(400, "Authorization expired. Start again from your MCP client.")
+            remembered = request.cookies.get(approval_cookie(data["client_id"]))
+            if remembered:
+                try:
+                    approval = json.loads(
+                        store.cipher.decrypt(remembered.encode(), ttl=consent_lifetime)
+                    )
+                except (InvalidToken, ValueError):
+                    approval = None
+                if (
+                    isinstance(approval, dict)
+                    and approval.get("purpose") == "mcp-consent"
+                    and approval.get("client_id") == data["client_id"]
+                    and approval.get("redirect_uri") == data["redirect_uri"]
+                    and set(data["scopes"]) <= set(approval["scopes"])
+                    and await tx.get("connection", approval["subject"]) is not None
+                ):
+                    return await start_authorization(tx, ticket, data, approval["subject"])
             data["browser"] = digest(browser)
             await tx.put("consent", ticket, data, expires_at=time.time() + 600)
         permission = "读取行者昵称、运动和路书"
@@ -376,6 +432,7 @@ def create_app(
             "<title>连接行者账户</title><h1>连接行者账户</h1>"
             f"<p>允许 {escape(data['client_name'])} {permission}。</p>"
             f"<p>授权后返回：<code>{escape(str(data['redirect_uri']))}</code></p>"
+            "<p>本浏览器将记住此次确认 30 天。同一账户、客户端和权限无需重复确认。</p>"
             '<form method="post" action="/connect">'
             f'<input type="hidden" name="ticket" value="{escape(ticket, quote=True)}">'
             f'<input type="hidden" name="csrf" value="{browser}">'
@@ -402,7 +459,6 @@ def create_app(
         ticket, csrf = str(form.get("ticket", "")), str(form.get("csrf", ""))
         cookie_name = f"xingzhe_consent_{digest(ticket)[:16]}"
         browser_cookie = request.cookies.get(cookie_name, "")
-        state, browser = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         async with store.transaction() as tx:
             data = await tx.get("consent", ticket)
             if (
@@ -416,35 +472,10 @@ def create_app(
                 raise HTTPException(
                     400, "Invalid or expired consent. Restart from your MCP client."
                 )
-            data["started"] = True
-            await tx.put("consent", ticket, data, expires_at=time.time() + 600)
-            await tx.put(
-                "state",
-                state,
-                {
-                    "browser": digest(browser),
-                    "ticket": ticket,
-                    "upstream_scope": "write" if WRITE_SCOPE in data["scopes"] else "read",
-                },
-                expires_at=time.time() + 600,
-            )
-        response = RedirectResponse(
-            xingzhe.authorization_url(state, write=WRITE_SCOPE in data["scopes"]), status_code=303
-        )
-        response.delete_cookie(cookie_name, path="/connect")
-        response.set_cookie(
-            f"xingzhe_oauth_{digest(state)[:16]}",
-            browser,
-            httponly=True,
-            secure=config.public_url.scheme == "https",
-            samesite="lax",
-            max_age=600,
-            path="/oauth/xingzhe/callback",
-        )
-        return response
+            return await start_authorization(tx, ticket, data)
 
     @app.get("/oauth/xingzhe/callback")
-    async def callback(request: Request, state: str, code: str | None = None) -> RedirectResponse:
+    async def callback(request: Request, state: str, code: str | None = None) -> Response:
         cookie_name = f"xingzhe_oauth_{digest(state)[:16]}"
         async with store.transaction() as tx:
             data = await tx.get("state", state)
@@ -466,12 +497,42 @@ def create_app(
             {"grant_type": "authorization_code", "code": code}, scope=data["upstream_scope"]
         )
         subject = await xingzhe.account_id(tokens.access_token)
+        async with store.transaction() as tx:
+            consent_data = await tx.get("consent", data["ticket"])
+            if consent_data is None:
+                raise HTTPException(400, "Consent expired. Start again from your MCP client.")
+            if data.get("remembered_subject") not in (None, subject):
+                await tx.delete("consent", data["ticket"])
+                error = JSONResponse(
+                    {"detail": "Xingzhe account changed. Restart from your MCP client to confirm."},
+                    status_code=400,
+                )
+                error.delete_cookie(approval_cookie(consent_data["client_id"]), path="/")
+                error.delete_cookie(cookie_name, path="/oauth/xingzhe/callback")
+                return error
         try:
             redirect = await provider.approve(data["ticket"], subject, tokens)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
         response = RedirectResponse(redirect, status_code=303)
         response.delete_cookie(cookie_name, path="/oauth/xingzhe/callback")
+        if not data.get("remembered_subject"):
+            approval = {
+                "purpose": "mcp-consent",
+                "client_id": consent_data["client_id"],
+                "redirect_uri": consent_data["redirect_uri"],
+                "scopes": consent_data["scopes"],
+                "subject": subject,
+            }
+            response.set_cookie(
+                approval_cookie(consent_data["client_id"]),
+                store.cipher.encrypt(json.dumps(approval).encode()).decode(),
+                httponly=True,
+                secure=config.public_url.scheme == "https",
+                samesite="lax",
+                max_age=consent_lifetime,
+                path="/",
+            )
         return response
 
     async def require_access(request: Request) -> str:
