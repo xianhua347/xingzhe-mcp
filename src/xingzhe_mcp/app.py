@@ -232,6 +232,8 @@ def create_app(
             max_age=600,
             path="/connect",
         )
+        # Keep a same-origin POST's Origin intact; no-referrer can turn it into null.
+        response.headers["Referrer-Policy"] = "same-origin"
         return response
 
     @app.post("/connect")
