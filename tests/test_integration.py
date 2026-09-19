@@ -72,6 +72,8 @@ def upstream(request: httpx.Request) -> httpx.Response:
 async def consent(client: httpx.AsyncClient, url: str) -> httpx.Response:
     page = await client.get(url)
     assert page.status_code == 200
+    # Chromium applies form-action to the POST redirect destination as well.
+    assert "form-action 'self' https://www.imxingzhe.com" in page.headers["content-security-policy"]
     ticket = parse_qs(urlsplit(url).query)["ticket"][0]
     csrf = re.search(r'name="csrf" value="([^"]+)"', page.text)
     assert csrf
