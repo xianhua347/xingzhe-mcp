@@ -17,7 +17,7 @@ from pydantic import AnyUrl
 
 from xingzhe_mcp.app import create_app
 from xingzhe_mcp.config import Settings
-from xingzhe_mcp.oauth import SCOPE, OAuthProvider
+from xingzhe_mcp.oauth import SCOPE, SCOPES, OAuthProvider
 from xingzhe_mcp.storage import Store
 from xingzhe_mcp.xingzhe import Tokens, Xingzhe
 
@@ -147,6 +147,7 @@ def test_oauth_mcp_end_to_end(settings: Settings) -> None:
             assert metadata["registration_endpoint"] == settings.origin + "/register"
             resource = (await client.get("/.well-known/oauth-protected-resource/mcp")).json()
             assert resource["resource"] == settings.resource
+            assert resource["scopes_supported"] == SCOPES
             assert (await client.post("/mcp", json={})).status_code == 401
             assert (await client.get("/api/activities")).status_code == 401
             exchange = await authorize(client, settings)

@@ -13,6 +13,7 @@ from cryptography.fernet import InvalidToken
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from mcp.server.auth.middleware.auth_context import get_access_token
+from mcp.server.auth.routes import create_protected_resource_routes
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
@@ -21,6 +22,7 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from psycopg import Error as DatabaseError
 from pydantic import AnyHttpUrl, ConfigDict, Field, RootModel, ValidationError, with_config
 from starlette.middleware.base import RequestResponseEndpoint
+from starlette.routing import Route as HTTPRoute
 
 from xingzhe_mcp.config import Settings
 from xingzhe_mcp.files import MAX_BASE64_LENGTH, MAX_FILE_BYTES
@@ -281,6 +283,21 @@ def create_app(
         )
 
     mcp_app = mcp.streamable_http_app()
+    # SDK 1.x advertises required_scopes as supported scopes. Writes are supported
+    # but must not become a requirement for every read-only MCP call.
+    metadata_routes = create_protected_resource_routes(
+        AnyHttpUrl(config.resource),
+        [config.public_url],
+        scopes_supported=SCOPES,
+        resource_name="Xingzhe",
+    )
+    metadata_paths = {route.path for route in metadata_routes}
+    mcp_app.routes[:] = [
+        route
+        for route in mcp_app.routes
+        if not (isinstance(route, HTTPRoute) and route.path in metadata_paths)
+    ]
+    mcp_app.routes.extend(metadata_routes)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
