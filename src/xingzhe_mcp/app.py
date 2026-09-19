@@ -2,7 +2,7 @@
 
 import secrets
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 from html import escape
 from typing import Annotated, Any, NotRequired, TypedDict
@@ -17,15 +17,24 @@ from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, Re
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import ToolAnnotations
+from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from psycopg import Error as DatabaseError
 from pydantic import AnyHttpUrl, ConfigDict, Field, RootModel, ValidationError, with_config
 from starlette.middleware.base import RequestResponseEndpoint
 
 from xingzhe_mcp.config import Settings
-from xingzhe_mcp.oauth import SCOPE, OAuthProvider
+from xingzhe_mcp.files import MAX_BASE64_LENGTH, MAX_FILE_BYTES
+from xingzhe_mcp.oauth import SCOPE, SCOPES, WRITE_SCOPE, OAuthProvider
 from xingzhe_mcp.storage import Store, digest
-from xingzhe_mcp.xingzhe import Activity, ActivityPage, Xingzhe, XingzheError
+from xingzhe_mcp.xingzhe import (
+    Activity,
+    ActivityPage,
+    RouteGPX,
+    RoutePage,
+    UploadPage,
+    Xingzhe,
+    XingzheError,
+)
 
 
 @with_config(ConfigDict(extra="forbid"))
@@ -65,7 +74,8 @@ def create_app(
     provider = OAuthProvider(config, store)
     mcp: FastMCP[Any] = FastMCP(
         "Xingzhe",
-        instructions="Read the authenticated user's mainland Xingzhe activities. "
+        instructions="Access the authenticated user's mainland Xingzhe activities and routes. "
+        "Creating routes and uploading FIT activities require write authorization. "
         "Dates use Unix milliseconds. Distance is meters; duration is seconds. "
         "Do not infer missing sensor measurements or undocumented units.",
         stateless_http=True,
@@ -77,7 +87,7 @@ def create_app(
             validate_token_resource=True,
             required_scopes=[SCOPE],
             client_registration_options=ClientRegistrationOptions(
-                enabled=True, valid_scopes=[SCOPE], default_scopes=[SCOPE]
+                enabled=True, valid_scopes=SCOPES, default_scopes=SCOPES
             ),
             revocation_options=RevocationOptions(enabled=True),
         ),
@@ -143,6 +153,132 @@ def create_app(
             raise ToolError(
                 "Authorization storage is unavailable. Contact the service owner."
             ) from None
+
+    async def checked[T](operation: Awaitable[T]) -> T:
+        try:
+            return await operation
+        except (XingzheError, ValueError) as exc:
+            raise ToolError(str(exc)) from None
+        except (DatabaseError, InvalidToken):
+            raise ToolError(
+                "Authorization storage is unavailable. Contact the service owner."
+            ) from None
+
+    @mcp.tool(annotations=annotations)
+    async def list_my_routes(
+        limit: Annotated[int, Query(ge=1, le=20)] = 20,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> RoutePage:
+        """List routes created by the authenticated account. Page using next_offset."""
+        return await checked(xingzhe.list_routes(mcp_subject(), "mine", limit, offset))
+
+    @mcp.tool(annotations=annotations)
+    async def list_collected_routes(
+        limit: Annotated[int, Query(ge=1, le=20)] = 20,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> RoutePage:
+        """List routes collected by the authenticated account, including shared routes."""
+        return await checked(xingzhe.list_routes(mcp_subject(), "collects", limit, offset))
+
+    @mcp.tool(annotations=annotations)
+    async def get_route(route_id: Annotated[int, Query(gt=0)]) -> dict[str, Any]:
+        """Read route navigation JSON, including elevation, turns and waypoints when supplied.
+
+        Use an ID from list_my_routes or list_collected_routes, or a route ID provided by the user.
+        Xingzhe enforces route visibility; a collected or shared route may belong to someone else.
+        """
+        return await checked(xingzhe.get_route(mcp_subject(), route_id))
+
+    @mcp.tool(annotations=annotations)
+    async def get_route_gpx(route_id: Annotated[int, Query(gt=0)]) -> RouteGPX:
+        """Read a route's GPX as UTF-8 text, up to 1,000,000 bytes. No download URL is exposed."""
+        return await checked(xingzhe.get_route_gpx(mcp_subject(), route_id))
+
+    @mcp.tool(annotations=annotations)
+    async def list_uploads(
+        limit: Annotated[int, Query(ge=1, le=20)] = 20,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> UploadPage:
+        """List the authenticated account's upload history. Check here before retrying an upload."""
+        return await checked(xingzhe.list_uploads(mcp_subject(), limit, offset))
+
+    write_annotations = ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
+    )
+    write_meta = {"securitySchemes": [{"type": "oauth2", "scopes": SCOPES}]}
+
+    def write_error() -> CallToolResult | None:
+        access = get_access_token()
+        if access is None or WRITE_SCOPE not in access.scopes:
+            return CallToolResult(
+                isError=True,
+                content=[
+                    TextContent(
+                        type="text",
+                        text="Write access is required. Reconnect with xingzhe:write permission.",
+                    )
+                ],
+                _meta={
+                    "mcp/www_authenticate": [
+                        f'Bearer resource_metadata="{config.origin}'
+                        '/.well-known/oauth-protected-resource/mcp", '
+                        f'error="insufficient_scope", scope="{SCOPE} {WRITE_SCOPE}", '
+                        'error_description="Reconnect to authorize writes"'
+                    ]
+                },
+            )
+        return None
+
+    @mcp.tool(annotations=write_annotations, meta=write_meta)
+    async def create_route_from_gpx(
+        title: Annotated[str, Field(min_length=1, max_length=100)],
+        gpx: Annotated[str, Field(min_length=1, max_length=MAX_FILE_BYTES)],
+        uuid: Annotated[str, Field(min_length=1, max_length=36)],
+        distance: Annotated[float, Field(ge=0, allow_inf_nan=False)],
+        sport: Annotated[int, Field(ge=1, le=4)] = 3,
+        desc: Annotated[str, Field(max_length=800)] = "",
+    ) -> CallToolResult:
+        """Create a Xingzhe route from inline GPX XML, up to 1,000,000 UTF-8 bytes.
+
+        This writes to the user's account. Supply a unique UUID, a title and distance in meters.
+        sport: 1 walk, 2 run, 3 cycle, 4 other.
+        Do not fabricate routes or retry blindly after a timeout.
+        """
+        if error := write_error():
+            return error
+        result = await checked(
+            xingzhe.create_route(mcp_subject(), title, gpx, uuid, distance, sport, desc)
+        )
+        return CallToolResult(
+            content=[TextContent(type="text", text=result.model_dump_json())],
+            structuredContent=result.model_dump(mode="json"),
+        )
+
+    @mcp.tool(annotations=write_annotations, meta=write_meta)
+    async def upload_activity_fit(
+        title: Annotated[str, Field(min_length=1, max_length=32)],
+        fit_base64: Annotated[str, Field(min_length=1, max_length=MAX_BASE64_LENGTH)],
+        filename: Annotated[
+            str, Field(min_length=5, max_length=256, pattern=r"^[^/\\\x00-\x1f]+\.fit$")
+        ] = "activity.fit",
+        detail: Annotated[str, Field(max_length=800)] = "",
+        sport: Annotated[int, Field(ge=0, le=3)] = 3,
+    ) -> CallToolResult:
+        """Upload an actual FIT activity to Xingzhe, up to 1,000,000 decoded bytes.
+
+        Supply standard base64 of the original FIT bytes, not a path, URL or generated workout.
+        MD5 is computed by the server. sport: 0 free activity, 1 walk, 2 run, 3 cycle.
+        This writes an activity. Check list_uploads before retrying an uncertain result.
+        """
+        if error := write_error():
+            return error
+        result = await checked(
+            xingzhe.upload_activity(mcp_subject(), title, fit_base64, filename, detail, sport)
+        )
+        return CallToolResult(
+            content=[TextContent(type="text", text=result.model_dump_json())],
+            structuredContent=result.model_dump(mode="json"),
+        )
 
     mcp_app = mcp.streamable_http_app()
 
@@ -211,12 +347,15 @@ def create_app(
                 raise HTTPException(400, "Authorization expired. Start again from your MCP client.")
             data["browser"] = digest(browser)
             await tx.put("consent", ticket, data, expires_at=time.time() + 600)
+        permission = "读取行者昵称、运动和路书"
+        if WRITE_SCOPE in data["scopes"]:
+            permission += "，并创建路书、上传运动数据"
         # DCR clients choose their own names. Show the actual callback destination as well.
         response = HTMLResponse(
             '<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width,initial-scale=1">'
             "<title>连接行者账户</title><h1>连接行者账户</h1>"
-            f"<p>允许 {escape(data['client_name'])} 读取你的行者昵称和运动记录。</p>"
+            f"<p>允许 {escape(data['client_name'])} {permission}。</p>"
             f"<p>授权后返回：<code>{escape(str(data['redirect_uri']))}</code></p>"
             '<form method="post" action="/connect">'
             f'<input type="hidden" name="ticket" value="{escape(ticket, quote=True)}">'
@@ -263,10 +402,16 @@ def create_app(
             await tx.put(
                 "state",
                 state,
-                {"browser": digest(browser), "ticket": ticket},
+                {
+                    "browser": digest(browser),
+                    "ticket": ticket,
+                    "upstream_scope": "write" if WRITE_SCOPE in data["scopes"] else "read",
+                },
                 expires_at=time.time() + 600,
             )
-        response = RedirectResponse(xingzhe.authorization_url(state), status_code=303)
+        response = RedirectResponse(
+            xingzhe.authorization_url(state, write=WRITE_SCOPE in data["scopes"]), status_code=303
+        )
         response.delete_cookie(cookie_name, path="/connect")
         response.set_cookie(
             f"xingzhe_oauth_{digest(state)[:16]}",
@@ -298,7 +443,9 @@ def create_app(
             raise HTTPException(
                 400, "Xingzhe authorization was not granted. Restart from your MCP client."
             )
-        tokens = await xingzhe.exchange({"grant_type": "authorization_code", "code": code})
+        tokens = await xingzhe.exchange(
+            {"grant_type": "authorization_code", "code": code}, scope=data["upstream_scope"]
+        )
         subject = await xingzhe.account_id(tokens.access_token)
         try:
             redirect = await provider.approve(data["ticket"], subject, tokens)

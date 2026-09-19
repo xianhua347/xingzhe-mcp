@@ -86,6 +86,7 @@ async def authorize(
     settings: Settings,
     code: str = "code",
     oauth_client: dict[str, Any] | None = None,
+    scope: str = SCOPE,
 ) -> dict[str, str]:
     credentials = oauth_client or {"client_id": "test-client", "client_secret": "b" * 40}
     redirect_uri = "http://localhost:8765/callback"
@@ -95,7 +96,7 @@ async def authorize(
             "response_type": "code",
             "client_id": credentials["client_id"],
             "redirect_uri": redirect_uri,
-            "scope": SCOPE,
+            "scope": scope,
             "state": "client-state",
             "code_challenge": CHALLENGE,
             "code_challenge_method": "S256",
@@ -107,6 +108,8 @@ async def authorize(
     assert redirect.status_code == 303
     state = parse_qs(urlsplit(redirect.headers["location"]).query)["state"][0]
     assert urlsplit(redirect.headers["location"]).hostname == "www.imxingzhe.com"
+    expected_scope = "write" if "xingzhe:write" in scope.split() else "read"
+    assert parse_qs(urlsplit(redirect.headers["location"]).query)["scope"] == [expected_scope]
     approval = await client.get("/oauth/xingzhe/callback", params={"state": state, "code": code})
     assert approval.status_code == 303, approval.text
     query = parse_qs(urlsplit(approval.headers["location"]).query)
@@ -184,6 +187,13 @@ def test_oauth_mcp_end_to_end(settings: Settings) -> None:
                 "list_activities",
                 "get_activity",
                 "get_profile",
+                "list_my_routes",
+                "list_collected_routes",
+                "get_route",
+                "get_route_gpx",
+                "create_route_from_gpx",
+                "list_uploads",
+                "upload_activity_fit",
             }
             result = await client.post(
                 "/mcp",

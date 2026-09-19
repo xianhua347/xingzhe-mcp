@@ -22,6 +22,8 @@ from xingzhe_mcp.storage import Store, Transaction
 from xingzhe_mcp.xingzhe import Tokens
 
 SCOPE = "activities:read"
+WRITE_SCOPE = "xingzhe:write"
+SCOPES = [SCOPE, WRITE_SCOPE]
 
 
 class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
@@ -60,10 +62,10 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
     ) -> str:
         if params.resource not in (None, self.settings.resource):
             raise AuthorizeError("invalid_request", "Unexpected resource")
-        if params.scopes and params.scopes != [SCOPE]:
-            raise AuthorizeError("invalid_scope", "Only activities:read is supported")
+        if set(params.scopes or []) - set(SCOPES):
+            raise AuthorizeError("invalid_scope", "Unsupported scope")
         params.resource = self.settings.resource
-        params.scopes = [SCOPE]
+        params.scopes = params.scopes or [SCOPE]
         ticket = secrets.token_urlsafe(32)
         async with self.store.transaction() as tx:
             await tx.put(
@@ -88,7 +90,7 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
             await tx.put("connection", subject, tokens.model_dump(), subject=subject)
             code = AuthorizationCode(
                 code=secrets.token_urlsafe(32),
-                scopes=[SCOPE],
+                scopes=params.scopes,
                 expires_at=time.time() + 300,
                 client_id=data["client_id"],
                 code_challenge=params.code_challenge,

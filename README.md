@@ -8,13 +8,20 @@ Python · FastAPI · MCP · Supabase · Vercel. Managed with [uv](https://docs.a
 
 ## Why this project?
 
-Your rides already live in the mainland China Xingzhe app. This service connects to its official API and exposes read-only MCP tools. One deployment supports multiple Xingzhe accounts. Each user authorizes their own account when connecting an MCP client.
+Your rides already live in the mainland China Xingzhe app. This service connects to its official API for activities, routes, and FIT uploads. One deployment supports multiple Xingzhe accounts. Each user authorizes their own account when connecting an MCP client.
 
 | Tool | What it does |
 | --- | --- |
 | `get_profile` | Returns the authenticated account’s stable ID and current Xingzhe nickname. |
 | `list_activities` | Lists activities with pagination and optional start/end timestamps. |
 | `get_activity` | Returns one activity's details, including sensor summaries supplied by Xingzhe. |
+| `list_my_routes` | Lists routes created by the authenticated account. |
+| `list_collected_routes` | Lists the account's collected routes. |
+| `get_route` | Reads route navigation, elevation, turns, and waypoints. |
+| `get_route_gpx` | Returns a route's GPX as text. |
+| `create_route_from_gpx` | Creates a route from GPX XML; requires write permission. |
+| `list_uploads` | Lists the account's activity upload history. |
+| `upload_activity_fit` | Uploads a FIT activity; requires write permission. |
 
 Timestamps used as filters are Unix milliseconds. Distance is in meters and duration in seconds. Other fields retain the upstream values; missing measurements are not inferred. The activities API does not provide per-second cadence streams or FIT downloads.
 
@@ -55,9 +62,21 @@ Use a stable HTTPS production domain for `PUBLIC_URL`, update the Xingzhe applic
 
 MCP uses stateless Streamable HTTP. Authorization state and encrypted tokens live in Supabase, so requests do not need to return to the same Vercel instance. Put preview deployments on a separate database and encryption key if you enable OAuth there.
 
+## Routes and uploads
+
+Route and upload lists accept `limit` from 1 to 20 and a nonnegative `offset`; use `next_offset` to continue. Shared or collected routes need not belong to the current user. Route detail and GPX requests use the current account's credentials and respect Xingzhe's visibility rules.
+
+`create_route_from_gpx` takes inline `gpx` XML, a `title`, a unique `uuid` of up to 36 characters, and `distance` in meters. Optional fields are `desc` and `sport` (1 walk, 2 run, 3 cycle, 4 other). `upload_activity_fit` takes `title`, `fit_base64`, and an optional `.fit` filename, description, and sport (0 free activity, 1 walk, 2 run, 3 cycle). The server computes the file MD5 and sends multipart form data.
+
+GPX and decoded FIT files are limited to **1,000,000 bytes** per file for inline MCP transport. GPX must be UTF-8 XML without DTD/entity declarations. FIT must be standard Base64 of the original file. Tools do not read local paths, fetch arbitrary file URLs, or automatically receive ChatGPT attachments. The calling client must supply the file content. GPX downloads return a filename and the XML text, not a public file URL.
+
+The [route guide](https://developer.imxingzhe.com/docs/openapi/routes/) and [upload guide](https://developer.imxingzhe.com/docs/openapi/uploads/) differ from the authenticated [live Swagger schema](https://www.imxingzhe.com/openapi/doc/?format=openapi). This implementation uses the verified `/routes/{id}/pro/` navigation endpoint; `/raw/` is not available on the live server. FIT uploads use `title`, `fit_file`, `fit_filename`, `md5`, and optional `detail` and `sport`. The actual description limit is 800 characters, not 1,500.
+
+Both writing tools declare `readOnlyHint: false` and `idempotentHint: false`. They require write permission in both the MCP grant and the stored Xingzhe authorization. Existing read-only grants stay read-only. When upgrading, refresh the ChatGPT tool list; to enable uploads, create a new OAuth connection that requests both scopes and complete Xingzhe authorization again. Clients registered before write support may need to be registered again. Uploads are not retried after timeouts or server failures; check the appropriate list before retrying to avoid duplicates.
+
 ## Access and storage
 
-The service requests only Xingzhe's `read` scope. MCP uses a separate OAuth flow with PKCE, short-lived access tokens, rotating refresh tokens, and account-bound authorization. Xingzhe credentials and tokens are never returned to MCP clients.
+MCP uses `activities:read` for reading and `xingzhe:write` for creating routes and uploading activities. New clients default to both scopes. Read-only clients can request just `activities:read`. The browser consent page lists the requested operations and requests Xingzhe `write` only when needed; otherwise it requests `read`. MCP uses a separate OAuth flow with PKCE, short-lived access tokens, rotating refresh tokens, and account-bound authorization. Xingzhe credentials and tokens are never returned to MCP clients.
 
 The private table has RLS enabled and no public policies. It is accessed by the server through PostgreSQL, not Supabase's Data API. Supabase may report an informational “RLS enabled, no policy” notice; denying Data API access is intentional. Keep `xingzhe` out of exposed schemas.
 
