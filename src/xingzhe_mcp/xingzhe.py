@@ -1,7 +1,5 @@
 """Official Xingzhe OAuth, activities, routes and uploads."""
 
-import hashlib
-import logging
 import time
 from typing import Any, Literal
 from urllib.parse import urlencode
@@ -10,11 +8,10 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from xingzhe_mcp.config import Settings
-from xingzhe_mcp.files import MAX_FILE_BYTES, fit_bytes, gpx_bytes
+from xingzhe_mcp.files import MAX_FILE_BYTES, gpx_bytes
 from xingzhe_mcp.storage import Store
 
 BASE_URL = "https://www.imxingzhe.com"
-logger = logging.getLogger(__name__)
 
 
 class XingzheError(Exception):
@@ -27,7 +24,6 @@ class Tokens(BaseModel):
     access_token: str
     refresh_token: str
     expires_at: float
-    scope: str = "read"
 
 
 class Activity(BaseModel):
@@ -84,28 +80,24 @@ class RouteGPX(BaseModel):
     gpx: str
 
 
-class CreatedRoute(BaseModel):
-    id: int
-
-
 class Xingzhe:
     def __init__(self, settings: Settings, store: Store, client: httpx.AsyncClient) -> None:
         self.settings = settings
         self.store = store
         self.client = client
 
-    def authorization_url(self, state: str, *, write: bool = False) -> str:
+    def authorization_url(self, state: str) -> str:
         return f"{BASE_URL}/oauth2/v2/authorize?" + urlencode(
             {
                 "client_id": self.settings.xingzhe_client_id,
                 "response_type": "code",
-                "scope": "write" if write else "read",
+                "scope": "read",
                 "state": state,
                 "redirect_uri": f"{self.settings.origin}/oauth/xingzhe/callback",
             }
         )
 
-    async def exchange(self, fields: dict[str, str], *, scope: str = "read") -> Tokens:
+    async def exchange(self, fields: dict[str, str]) -> Tokens:
         try:
             response = await self.client.post(
                 f"{BASE_URL}/oauth2/v2/access_token/",
@@ -118,16 +110,6 @@ class Xingzhe:
                 files={key: (None, value) for key, value in fields.items()},
             )
             data = self._response(response)
-            granted_scope = data.get("scope", scope)
-            if (
-                "write" in scope.split()
-                and isinstance(granted_scope, str)
-                and "write" not in granted_scope.split()
-            ):
-                logger.warning(
-                    "Xingzhe did not grant requested write scope during %s",
-                    fields.get("grant_type", "unknown"),
-                )
             expiry = data.get("expires_at")
             if expiry is None:
                 expiry = time.time() + float(data["expires_in"])
@@ -136,7 +118,6 @@ class Xingzhe:
                     access_token=data["access_token"],
                     refresh_token=data.get("refresh_token") or fields.get("refresh_token"),
                     expires_at=float(expiry),
-                    scope=granted_scope,
                 )
             )
         except (KeyError, TypeError, ValueError, httpx.HTTPError) as exc:
@@ -188,27 +169,20 @@ class Xingzhe:
             raise XingzheError("Xingzhe account identity changed. Reconnect your account.", 403)
         return profile
 
-    async def access_token(
-        self, subject: str, rejected: str | None = None, *, write: bool = False
-    ) -> str:
+    async def access_token(self, subject: str, rejected: str | None = None) -> str:
         async with self.store.transaction(f"connection:{subject}") as tx:
             data = await tx.get("connection", subject)
             if data is None:
                 raise XingzheError("Reconnect your Xingzhe account from your MCP client.", 409)
             tokens = Tokens.model_validate(data)
-            if write and "write" not in tokens.scope.split():
-                raise XingzheError("Reconnect with Xingzhe write permission before uploading.", 403)
             if tokens.expires_at < time.time() + 60 or tokens.access_token == rejected:
                 tokens = await self.exchange(
                     {
                         "grant_type": "refresh_token",
                         "refresh_token": tokens.refresh_token,
                     },
-                    scope=tokens.scope,
                 )
                 await tx.put("connection", subject, tokens.model_dump(), subject=subject)
-            if write and "write" not in tokens.scope.split():
-                raise XingzheError("Reconnect with Xingzhe write permission before uploading.", 403)
             return tokens.access_token
 
     async def response(
@@ -217,23 +191,17 @@ class Xingzhe:
         path: str,
         params: dict[str, int] | None = None,
         *,
-        fields: dict[str, str] | None = None,
-        file: tuple[str, str, bytes, str] | None = None,
         max_bytes: int = 2_000_000,
     ) -> httpx.Response:
-        write = fields is not None
-        token = await self.access_token(subject, write=write)
+        token = await self.access_token(subject)
         for attempt in range(2):
             try:
-                files = {file[0]: (file[1], file[2], file[3])} if file else None
                 async with self.client.stream(
-                    "POST" if write else "GET",
+                    "GET",
                     f"{BASE_URL}/openapi/v1/{path}",
                     params=params,
-                    data=fields,
-                    files=files,
                     headers={"Authorization": f"Bearer {token}"},
-                    timeout=60 if write else 15,
+                    timeout=15,
                 ) as response:
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
@@ -247,11 +215,6 @@ class Xingzhe:
                         headers={"content-type": response.headers.get("content-type", "")},
                         content=bytes(body),
                     )
-                if write and result.status_code >= 500:
-                    raise XingzheError(
-                        "Upload outcome is unknown. "
-                        "Check list_uploads or list_my_routes before retrying."
-                    )
                 if result.status_code == 401 or "json" in result.headers.get("content-type", ""):
                     self._response(result)
                 elif result.is_error or result.is_redirect:
@@ -263,15 +226,9 @@ class Xingzhe:
             except XingzheError as exc:
                 if exc.status != 401 or attempt:
                     raise
-                token = await self.access_token(subject, rejected=token, write=write)
+                token = await self.access_token(subject, rejected=token)
             except httpx.HTTPError as exc:
-                message = (
-                    "Upload outcome is unknown. "
-                    "Check list_uploads or list_my_routes before retrying."
-                    if write
-                    else "Cannot reach Xingzhe. Try again later."
-                )
-                raise XingzheError(message) from exc
+                raise XingzheError("Cannot reach Xingzhe. Try again later.") from exc
         raise AssertionError("Unreachable")
 
     async def request(
@@ -279,11 +236,8 @@ class Xingzhe:
         subject: str,
         path: str,
         params: dict[str, int] | None = None,
-        *,
-        fields: dict[str, str] | None = None,
-        file: tuple[str, str, bytes, str] | None = None,
     ) -> dict[str, Any]:
-        return self._response(await self.response(subject, path, params, fields=fields, file=file))
+        return self._response(await self.response(subject, path, params))
 
     async def list_routes(
         self,
@@ -327,37 +281,6 @@ class Xingzhe:
             raise XingzheError("Xingzhe returned invalid UTF-8 GPX data.") from exc
         return RouteGPX(route_id=route_id, filename=f"route-{route_id}.gpx", gpx=content)
 
-    async def create_route(
-        self,
-        subject: str,
-        title: str,
-        gpx: str,
-        uuid: str,
-        distance: float,
-        sport: int = 3,
-        desc: str = "",
-    ) -> CreatedRoute:
-        raw = gpx_bytes(gpx)
-        data = await self.request(
-            subject,
-            "routes/gpx/",
-            fields={
-                "title": title,
-                "desc": desc,
-                "uuid": uuid,
-                "distance": str(distance),
-                "sport": str(sport),
-            },
-            file=("gpx_file", "route.gpx", raw, "application/gpx+xml"),
-        )
-        try:
-            return CreatedRoute.model_validate(data.get("data", data))
-        except ValueError as exc:
-            raise XingzheError(
-                "Xingzhe returned an invalid route creation result. "
-                "Check list_my_routes before retrying."
-            ) from exc
-
     async def list_uploads(self, subject: str, limit: int = 20, offset: int = 0) -> UploadPage:
         if not 1 <= limit <= 20 or offset < 0:
             raise ValueError("limit must be 1–20 and offset must be nonnegative")
@@ -371,35 +294,6 @@ class Xingzhe:
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise XingzheError("Xingzhe returned invalid upload data.") from exc
-
-    async def upload_activity(
-        self,
-        subject: str,
-        title: str,
-        fit_base64: str,
-        filename: str,
-        detail: str = "",
-        sport: int = 3,
-    ) -> Upload:
-        raw = fit_bytes(fit_base64)
-        data = await self.request(
-            subject,
-            "uploads/",
-            fields={
-                "title": title,
-                "detail": detail,
-                "fit_filename": filename,
-                "md5": hashlib.md5(raw, usedforsecurity=False).hexdigest(),
-                "sport": str(sport),
-            },
-            file=("fit_file", filename, raw, "application/octet-stream"),
-        )
-        try:
-            return Upload.model_validate(data.get("data", data))
-        except ValueError as exc:
-            raise XingzheError(
-                "Xingzhe returned an invalid upload result. Check list_uploads before retrying."
-            ) from exc
 
     async def list_activities(
         self,

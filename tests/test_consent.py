@@ -10,7 +10,7 @@ from test_integration import CHALLENGE, authorize, upstream
 
 from xingzhe_mcp.app import create_app
 from xingzhe_mcp.config import Settings
-from xingzhe_mcp.oauth import SCOPE, SCOPES
+from xingzhe_mcp.oauth import SCOPE
 from xingzhe_mcp.storage import Store
 
 
@@ -76,8 +76,7 @@ def test_remembered_consent(settings: Settings) -> None:
             assert cookie.path == "/" and cookie.has_nonstandard_attr("HttpOnly")
             assert cookie.get_nonstandard_attr("SameSite") == "lax"
             assert (await start()).status_code == 303
-            # Scope elevation, a different registered callback or a different client needs consent.
-            assert (await start(" ".join(SCOPES))).status_code == 200
+            # A different registered callback or client needs consent.
             assert (await start(redirect="other")).status_code == 200
             assert (await start(client_id="test-client")).status_code == 200
             cookie.value = "tampered"
@@ -107,9 +106,9 @@ def test_remembered_consent(settings: Settings) -> None:
             async with store.transaction() as tx:
                 assert await tx.get("connection", "xingzhe:456") is None
             assert (await start()).status_code == 200
-            # An explicit confirmation can connect the new account and approve write access.
-            await authorize(client, settings, oauth_client=credentials, scope=" ".join(SCOPES))
-            assert (await start(" ".join(SCOPES))).status_code == 303
+            # An explicit confirmation can connect the new account.
+            await authorize(client, settings, oauth_client=credentials)
+            assert (await start()).status_code == 303
             async with store.transaction() as tx:
                 await tx.disconnect("xingzhe:456")
             assert (await start()).status_code == 200

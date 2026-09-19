@@ -111,8 +111,7 @@ async def authorize(
     assert redirect.status_code == 303
     state = parse_qs(urlsplit(redirect.headers["location"]).query)["state"][0]
     assert urlsplit(redirect.headers["location"]).hostname == "www.imxingzhe.com"
-    expected_scope = "write" if "xingzhe:write" in scope.split() else "read"
-    assert parse_qs(urlsplit(redirect.headers["location"]).query)["scope"] == [expected_scope]
+    assert parse_qs(urlsplit(redirect.headers["location"]).query)["scope"] == ["read"]
     approval = await client.get("/oauth/xingzhe/callback", params={"state": state, "code": code})
     assert approval.status_code == 303, approval.text
     query = parse_qs(urlsplit(approval.headers["location"]).query)
@@ -195,9 +194,7 @@ def test_oauth_mcp_end_to_end(settings: Settings) -> None:
                 "list_collected_routes",
                 "get_route",
                 "get_route_gpx",
-                "create_route_from_gpx",
                 "list_uploads",
-                "upload_activity_fit",
             }
             result = await client.post(
                 "/mcp",

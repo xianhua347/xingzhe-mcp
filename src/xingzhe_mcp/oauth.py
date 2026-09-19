@@ -22,8 +22,7 @@ from xingzhe_mcp.storage import Store, Transaction
 from xingzhe_mcp.xingzhe import Tokens
 
 SCOPE = "activities:read"
-WRITE_SCOPE = "xingzhe:write"
-SCOPES = [SCOPE, WRITE_SCOPE]
+SCOPES = [SCOPE]
 
 
 class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
@@ -123,6 +122,7 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
     async def _issue(
         self, tx: Transaction, scopes: list[str], grant_id: str, subject: str, client_id: str
     ) -> OAuthToken:
+        scopes = [scope for scope in scopes if scope in SCOPES]
         now = int(time.time())
         access = AccessToken(
             token=secrets.token_urlsafe(32),

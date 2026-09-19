@@ -14,20 +14,17 @@ from cryptography.fernet import InvalidToken
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from mcp.server.auth.middleware.auth_context import get_access_token
-from mcp.server.auth.routes import create_protected_resource_routes
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from mcp.types import ToolAnnotations
 from psycopg import Error as DatabaseError
 from pydantic import AnyHttpUrl, ConfigDict, Field, RootModel, ValidationError, with_config
 from starlette.middleware.base import RequestResponseEndpoint
-from starlette.routing import Route as HTTPRoute
 
 from xingzhe_mcp.config import Settings
-from xingzhe_mcp.files import MAX_BASE64_LENGTH, MAX_FILE_BYTES
-from xingzhe_mcp.oauth import SCOPE, SCOPES, WRITE_SCOPE, OAuthProvider
+from xingzhe_mcp.oauth import SCOPE, SCOPES, OAuthProvider
 from xingzhe_mcp.storage import Store, Transaction, digest
 from xingzhe_mcp.xingzhe import (
     Activity,
@@ -78,7 +75,6 @@ def create_app(
     mcp: FastMCP[Any] = FastMCP(
         "Xingzhe",
         instructions="Access the authenticated user's mainland Xingzhe activities and routes. "
-        "Creating routes and uploading FIT activities require write authorization. "
         "Dates use Unix milliseconds. Distance is meters; duration is seconds. "
         "Do not infer missing sensor measurements or undocumented units.",
         stateless_http=True,
@@ -204,103 +200,10 @@ def create_app(
         limit: Annotated[int, Query(ge=1, le=20)] = 20,
         offset: Annotated[int, Query(ge=0)] = 0,
     ) -> UploadPage:
-        """List the authenticated account's upload history. Check here before retrying an upload."""
+        """List the authenticated account's existing upload history."""
         return await checked(xingzhe.list_uploads(mcp_subject(), limit, offset))
 
-    write_annotations = ToolAnnotations(
-        readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True
-    )
-    write_meta = {"securitySchemes": [{"type": "oauth2", "scopes": SCOPES}]}
-
-    def write_error() -> CallToolResult | None:
-        access = get_access_token()
-        if access is None or WRITE_SCOPE not in access.scopes:
-            return CallToolResult(
-                isError=True,
-                content=[
-                    TextContent(
-                        type="text",
-                        text="Write access is required. Reconnect with xingzhe:write permission.",
-                    )
-                ],
-                _meta={
-                    "mcp/www_authenticate": [
-                        f'Bearer resource_metadata="{config.origin}'
-                        '/.well-known/oauth-protected-resource/mcp", '
-                        f'error="insufficient_scope", scope="{SCOPE} {WRITE_SCOPE}", '
-                        'error_description="Reconnect to authorize writes"'
-                    ]
-                },
-            )
-        return None
-
-    @mcp.tool(annotations=write_annotations, meta=write_meta)
-    async def create_route_from_gpx(
-        title: Annotated[str, Field(min_length=1, max_length=100)],
-        gpx: Annotated[str, Field(min_length=1, max_length=MAX_FILE_BYTES)],
-        uuid: Annotated[str, Field(min_length=1, max_length=36)],
-        distance: Annotated[float, Field(ge=0, allow_inf_nan=False)],
-        sport: Annotated[int, Field(ge=1, le=4)] = 3,
-        desc: Annotated[str, Field(max_length=800)] = "",
-    ) -> CallToolResult:
-        """Create a Xingzhe route from inline GPX XML, up to 1,000,000 UTF-8 bytes.
-
-        This writes to the user's account. Supply a unique UUID, a title and distance in meters.
-        sport: 1 walk, 2 run, 3 cycle, 4 other.
-        Do not fabricate routes or retry blindly after a timeout.
-        """
-        if error := write_error():
-            return error
-        result = await checked(
-            xingzhe.create_route(mcp_subject(), title, gpx, uuid, distance, sport, desc)
-        )
-        return CallToolResult(
-            content=[TextContent(type="text", text=result.model_dump_json())],
-            structuredContent=result.model_dump(mode="json"),
-        )
-
-    @mcp.tool(annotations=write_annotations, meta=write_meta)
-    async def upload_activity_fit(
-        title: Annotated[str, Field(min_length=1, max_length=32)],
-        fit_base64: Annotated[str, Field(min_length=1, max_length=MAX_BASE64_LENGTH)],
-        filename: Annotated[
-            str, Field(min_length=5, max_length=256, pattern=r"^[^/\\\x00-\x1f]+\.fit$")
-        ] = "activity.fit",
-        detail: Annotated[str, Field(max_length=800)] = "",
-        sport: Annotated[int, Field(ge=0, le=3)] = 3,
-    ) -> CallToolResult:
-        """Upload an actual FIT activity to Xingzhe, up to 1,000,000 decoded bytes.
-
-        Supply standard base64 of the original FIT bytes, not a path, URL or generated workout.
-        MD5 is computed by the server. sport: 0 free activity, 1 walk, 2 run, 3 cycle.
-        This writes an activity. Check list_uploads before retrying an uncertain result.
-        """
-        if error := write_error():
-            return error
-        result = await checked(
-            xingzhe.upload_activity(mcp_subject(), title, fit_base64, filename, detail, sport)
-        )
-        return CallToolResult(
-            content=[TextContent(type="text", text=result.model_dump_json())],
-            structuredContent=result.model_dump(mode="json"),
-        )
-
     mcp_app = mcp.streamable_http_app()
-    # SDK 1.x advertises required_scopes as supported scopes. Writes are supported
-    # but must not become a requirement for every read-only MCP call.
-    metadata_routes = create_protected_resource_routes(
-        AnyHttpUrl(config.resource),
-        [config.public_url],
-        scopes_supported=SCOPES,
-        resource_name="Xingzhe",
-    )
-    metadata_paths = {route.path for route in metadata_routes}
-    mcp_app.routes[:] = [
-        route
-        for route in mcp_app.routes
-        if not (isinstance(route, HTTPRoute) and route.path in metadata_paths)
-    ]
-    mcp_app.routes.extend(metadata_routes)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -376,14 +279,11 @@ def create_app(
             {
                 "browser": digest(browser),
                 "ticket": ticket,
-                "upstream_scope": "write" if WRITE_SCOPE in data["scopes"] else "read",
                 "remembered_subject": subject,
             },
             expires_at=time.time() + 600,
         )
-        response = RedirectResponse(
-            xingzhe.authorization_url(state, write=WRITE_SCOPE in data["scopes"]), status_code=303
-        )
+        response = RedirectResponse(xingzhe.authorization_url(state), status_code=303)
         response.delete_cookie(f"xingzhe_consent_{digest(ticket)[:16]}", path="/connect")
         response.set_cookie(
             f"xingzhe_oauth_{digest(state)[:16]}",
@@ -423,8 +323,6 @@ def create_app(
             data["browser"] = digest(browser)
             await tx.put("consent", ticket, data, expires_at=time.time() + 600)
         permission = "读取行者昵称、运动和路书"
-        if WRITE_SCOPE in data["scopes"]:
-            permission += "，并创建路书、上传运动数据"
         # DCR clients choose their own names. Show the actual callback destination as well.
         response = HTMLResponse(
             '<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
@@ -493,9 +391,7 @@ def create_app(
             raise HTTPException(
                 400, "Xingzhe authorization was not granted. Restart from your MCP client."
             )
-        tokens = await xingzhe.exchange(
-            {"grant_type": "authorization_code", "code": code}, scope=data["upstream_scope"]
-        )
+        tokens = await xingzhe.exchange({"grant_type": "authorization_code", "code": code})
         subject = await xingzhe.account_id(tokens.access_token)
         async with store.transaction() as tx:
             consent_data = await tx.get("consent", data["ticket"])

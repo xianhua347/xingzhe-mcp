@@ -8,7 +8,7 @@ Python · FastAPI · MCP · Supabase · Vercel，使用 [uv](https://docs.astral
 
 ## 为什么做这个项目？
 
-骑行记录已经保存在中国大陆行者 App 中。这个服务通过官方 API 提供运动记录、路书查询和 FIT 上传工具。一个部署支持多个行者账号，每位用户在连接 MCP 客户端时授权自己的账号。
+骑行记录已经保存在中国大陆行者 App 中。这个服务通过官方 API 提供运动记录、路书和上传记录的只读查询工具。一个部署支持多个行者账号，每位用户在连接 MCP 客户端时授权自己的账号。
 
 | 工具 | 用途 |
 | --- | --- |
@@ -19,9 +19,7 @@ Python · FastAPI · MCP · Supabase · Vercel，使用 [uv](https://docs.astral
 | `list_collected_routes` | 查询当前账号收藏的路书。 |
 | `get_route` | 获取路书导航、高程、转向和途经点数据。 |
 | `get_route_gpx` | 以文本返回路书 GPX。 |
-| `create_route_from_gpx` | 用 GPX 创建路书，需要写入权限。 |
 | `list_uploads` | 查询当前账号的运动上传记录。 |
-| `upload_activity_fit` | 上传 FIT 运动文件，需要写入权限。 |
 
 查询时间使用 Unix 毫秒时间戳，距离单位为米，时长单位为秒。其他字段保留上游原值，不推测缺失的测量值。运动 API 不提供逐秒踏频序列或 FIT 文件下载。
 
@@ -64,21 +62,17 @@ ChatGPT → MCP 授权 → 行者登录并确认授权
 
 MCP 使用无状态 Streamable HTTP。授权状态和加密令牌保存在 Supabase，后续请求可以由不同 Vercel 实例处理。如果在预览部署中启用 OAuth，请使用独立数据库和加密密钥。
 
-## 路书与上传
+## 路书与上传记录
 
 路书和上传列表的 `limit` 范围为 1–20，`offset` 为非负数，使用 `next_offset` 翻页。收藏或共享路书可能属于其他用户，导航和 GPX 请求始终携带当前账号的凭证，由行者控制可见范围。
 
-`create_route_from_gpx` 接收 GPX XML 文本 `gpx`、标题 `title`、最长 36 字符的唯一标识 `uuid` 和以米为单位的 `distance`。可选字段为 `desc` 和 `sport`，运动类型为 1 徒步、2 跑步、3 骑行、4 其他。`upload_activity_fit` 接收标题 `title`、原文件的 Base64 `fit_base64`，以及可选的 `.fit` 文件名、描述和运动类型。上传的运动类型为 0 自由行、1 徒步、2 跑步、3 骑行。服务端计算 MD5，并通过 multipart 表单发送文件。
+下载 GPX 会返回文件名和 UTF-8 XML 文本，每个文件上限为 **1,000,000 字节**。不允许 DTD 或实体声明，工具不会下载任意文件 URL。
 
-为适配远程 MCP，每个 GPX 或解码后的 FIT 文件上限为 **1,000,000 字节**。GPX 必须是 UTF-8 XML，不允许 DTD 或实体声明；FIT 使用原始文件的标准 Base64。工具不读取本地路径、不下载任意文件 URL，也不会自动接收 ChatGPT 附件，调用方需要传入文件内容。下载 GPX 会返回文件名和 XML 文本，不生成公开下载地址。
-
-[路书文档](https://developer.imxingzhe.com/docs/openapi/routes/)和[上传文档](https://developer.imxingzhe.com/docs/openapi/uploads/)与需要授权的[线上 Swagger](https://www.imxingzhe.com/openapi/doc/?format=openapi)存在差异。本项目采用已验证可用的 `/routes/{id}/pro/` 导航接口，线上 `/raw/` 不存在。FIT 上传使用 `title`、`fit_file`、`fit_filename`、`md5`，以及可选的 `detail`、`sport`；实际描述上限为 800 字符。
-
-两个写入工具声明 `readOnlyHint: false` 和 `idempotentHint: false`，同时检查 MCP 和行者授权中的写入权限。已有只读授权不会自动升级。更新后刷新 ChatGPT 工具列表；需要上传时，创建申请两项权限的 OAuth 连接并重新完成行者授权。旧版本注册的客户端可能需要重新注册。超时或服务器错误后不自动重试上传，请先查询对应列表，避免重复创建记录。
+[路书文档](https://developer.imxingzhe.com/docs/openapi/routes/)与需要授权的[线上 Swagger](https://www.imxingzhe.com/openapi/doc/?format=openapi)存在差异。本项目采用已验证可用的 `/routes/{id}/pro/` 导航接口，线上 `/raw/` 不存在。
 
 ## 访问与存储
 
-MCP 使用 `activities:read` 读取数据，使用 `xingzhe:write` 创建路书和上传运动。新客户端默认申请两项权限，也可以只申请 `activities:read`。浏览器确认页会列出实际申请的操作，需要写入时向行者申请 `write`，否则申请 `read`。MCP 使用独立的 OAuth 流程，支持 PKCE、短期访问令牌、刷新令牌轮换和按账户绑定授权。行者凭证与令牌不会返回给 MCP 客户端。
+全部 MCP 工具均为只读。MCP 仅申请 `activities:read`，行者授权仅申请 `read`。OAuth 支持 PKCE、短期访问令牌、刷新令牌轮换和按账户绑定授权。行者凭证与令牌不会返回给 MCP 客户端。
 
 私有表启用 RLS，不设置公开访问策略。服务通过 PostgreSQL 访问它，不使用 Supabase Data API。Supabase 可能提示“已启用 RLS，但没有策略”，这是阻止 Data API 访问的预期配置。不要将 `xingzhe` 加入公开 schema 列表。
 
