@@ -14,14 +14,15 @@ Python · FastAPI · MCP · Supabase · Vercel，使用 [uv](https://docs.astral
 | --- | --- |
 | `get_profile` | 返回当前授权账号的固定 ID 和最新行者昵称。 |
 | `list_activities` | 分页查询运动记录，可指定开始和结束时间戳。 |
-| `get_activity` | 获取单次运动详情，包括行者提供的传感器汇总数据。 |
+| `get_activity` | 获取单次运动总量和传感器汇总，不包含逐点数据。 |
+| `get_activity_stream` | 按字段和分页读取时间戳及传感器序列。 |
 | `list_my_routes` | 查询当前账号创建的路书。 |
 | `list_collected_routes` | 查询当前账号收藏的路书。 |
 | `get_route` | 获取路书导航、高程、转向和途经点数据。 |
 | `get_route_gpx` | 以文本返回路书 GPX。 |
 | `list_uploads` | 查询当前账号的运动上传记录。 |
 
-查询时间使用 Unix 毫秒时间戳，距离单位为米，时长单位为秒。其他字段保留上游原值，不推测缺失的测量值。运动 API 不提供逐秒踏频序列或 FIT 文件下载。
+查询时间使用 Unix 毫秒时间戳，距离单位为米，时长单位为秒。其他字段保留上游原值，不推测缺失的测量值。逐点数据请使用 `get_activity_stream`。
 
 ## 快速开始
 
@@ -61,6 +62,16 @@ ChatGPT → MCP 授权 → 行者登录并确认授权
 将 `PUBLIC_URL` 设置为固定的 HTTPS 生产域名，更新行者应用的回调地址，然后重新部署。连接行者前先检查 `/ready`。MCP 客户端必须能直接访问 OAuth 元数据和 `/mcp`，不能被 Vercel 登录保护拦截；运动数据由应用自身的 OAuth 保护。
 
 MCP 使用无状态 Streamable HTTP。授权状态和加密令牌保存在 Supabase，后续请求可以由不同 Vercel 实例处理。如果在预览部署中启用 OAuth，请使用独立数据库和加密密钥。
+
+## 运动采样序列
+
+`get_activity_stream` 读取当前授权用户的运动采样点。通过 `fields` 选择踏频 `cadence`、心率 `heartrate`、位置 `location`、速度、距离、海拔、功率、温度或左右平衡。始终返回 `timestamp`；省略 `fields` 时返回上游全部序列。
+
+各数组相同下标对应同一个采样点。`limit` 默认 500，范围为 1 到 1,000；将 `next_offset` 作为下一次的 `offset`。`total_points` 为整条活动的采样点数。缺失的传感器序列保持空数组，并列入 `unavailable_streams`，不会用零补齐。
+
+运动详情时间戳使用 Unix 毫秒，已验证的 stream 时间戳使用 Unix 秒。保留原始数值和采样间隔，包括零值、重复时间戳和时间缺口；其他 stream 字段不做单位换算。逐点平均值或排除零踏频后的平均值，不一定等于 App 汇总。详情中的踏频为零，也不代表采样序列没有踏频。`get_activity` 保留上游汇总，不用计算结果覆盖。
+
+线上接口同时提供 `/activities/` 和 `/workout/` 路径。本项目使用 `/activities/{id}/stream/`，通过 POST 读取数据，沿用已有 `read` 授权，不上传或修改运动记录。每次分页请求都会获取完整上游响应，上限为 20,000,000 字节，然后选择字段并截取采样点。此工具不提供记圈数据或 FIT 下载。
 
 ## 路书与上传记录
 

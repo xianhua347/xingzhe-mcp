@@ -29,8 +29,10 @@ from xingzhe_mcp.storage import Store, Transaction, digest
 from xingzhe_mcp.xingzhe import (
     Activity,
     ActivityPage,
+    ActivityStreamPage,
     RouteGPX,
     RoutePage,
+    StreamField,
     UploadPage,
     Xingzhe,
     XingzheError,
@@ -145,7 +147,13 @@ def create_app(
 
     @mcp.tool(annotations=annotations, meta=read_meta)
     async def get_activity(activity_id: Annotated[int, Query(gt=0)]) -> Activity:
-        """Get activity details including cadence, heart rate and power when supplied by Xingzhe."""
+        """Read activity summary totals and averages, not per-point samples or lap details.
+
+        Preserve Xingzhe's summary values. Cadence summaries may be zero even when cadence
+        samples exist; use get_activity_stream for cadence, heart rate and other time series.
+        A zero summary does not prove that no sensor was connected. Distance is meters,
+        duration seconds, start_time/end_time Unix milliseconds; other units are unchanged.
+        """
         try:
             return await xingzhe.get_activity(mcp_subject(), activity_id)
         except (XingzheError, ValueError) as exc:
@@ -164,6 +172,28 @@ def create_app(
             raise ToolError(
                 "Authorization storage is unavailable. Contact the service owner."
             ) from None
+
+    @mcp.tool(annotations=annotations, meta=read_meta)
+    async def get_activity_stream(
+        activity_id: Annotated[int, Query(gt=0)],
+        fields: Annotated[list[StreamField] | None, Field(min_length=1, max_length=11)] = None,
+        limit: Annotated[int, Query(ge=1, le=1000)] = 500,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> ActivityStreamPage:
+        """Read the authenticated account's original activity samples with aligned pagination.
+
+        Select fields such as cadence, heartrate, speed, altitude or location; timestamp is
+        always included. Empty/missing sensors are listed in unavailable_streams, not filled
+        with zero. Use next_offset for more points; each call fetches the full upstream stream.
+        Keep raw values and irregular/duplicate timestamps. Stream timestamps are Unix seconds
+        in verified responses, unlike millisecond activity summaries; confirm before joining.
+        Page averages are not whole-activity averages. Excluding zero cadence changes the
+        averaging convention; neither sample means nor peaks replace upstream summary values.
+        This is read-only despite Xingzhe using POST internally. No write permission is needed.
+        """
+        return await checked(
+            xingzhe.get_activity_stream(mcp_subject(), activity_id, fields, limit, offset)
+        )
 
     @mcp.tool(annotations=annotations, meta=read_meta)
     async def list_my_routes(

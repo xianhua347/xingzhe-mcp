@@ -189,6 +189,7 @@ def test_oauth_mcp_end_to_end(settings: Settings) -> None:
             assert {tool["name"] for tool in tools.json()["result"]["tools"]} == {
                 "list_activities",
                 "get_activity",
+                "get_activity_stream",
                 "get_profile",
                 "list_my_routes",
                 "list_collected_routes",

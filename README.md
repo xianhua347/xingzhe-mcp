@@ -14,14 +14,15 @@ Your rides already live in the mainland China Xingzhe app. This service connects
 | --- | --- |
 | `get_profile` | Returns the authenticated account’s stable ID and current Xingzhe nickname. |
 | `list_activities` | Lists activities with pagination and optional start/end timestamps. |
-| `get_activity` | Returns one activity's details, including sensor summaries supplied by Xingzhe. |
+| `get_activity` | Returns activity totals and sensor summaries, without individual samples. |
+| `get_activity_stream` | Returns aligned timestamp and sensor arrays with field selection and pagination. |
 | `list_my_routes` | Lists routes created by the authenticated account. |
 | `list_collected_routes` | Lists the account's collected routes. |
 | `get_route` | Reads route navigation, elevation, turns, and waypoints. |
 | `get_route_gpx` | Returns a route's GPX as text. |
 | `list_uploads` | Lists the account's activity upload history. |
 
-Timestamps used as filters are Unix milliseconds. Distance is in meters and duration in seconds. Other fields retain the upstream values; missing measurements are not inferred. The activities API does not provide per-second cadence streams or FIT downloads.
+Timestamps used as filters are Unix milliseconds. Distance is in meters and duration in seconds. Other fields retain the upstream values; missing measurements are not inferred. Use `get_activity_stream` for individual samples.
 
 ## Getting started
 
@@ -61,6 +62,16 @@ Connect your Supabase integration to this Vercel project and supply the variable
 Use a stable HTTPS production domain for `PUBLIC_URL`, update the Xingzhe application's callback, then redeploy. Check `/ready` before connecting Xingzhe. MCP clients must be able to reach the OAuth metadata and `/mcp` without a Vercel login wall. Application OAuth still protects the activity data.
 
 MCP uses stateless Streamable HTTP. Authorization state and encrypted tokens live in Supabase, so requests do not need to return to the same Vercel instance. Put preview deployments on a separate database and encryption key if you enable OAuth there.
+
+## Activity streams
+
+`get_activity_stream` reads the authorized user's samples. Use `fields` to select cadence, heart rate (`heartrate`), location, speed, distance, altitude, power, temperature, or left/right balance. Timestamps are always included. Omit `fields` to return all upstream streams.
+
+Each array index represents the same sample. `limit` defaults to 500 and accepts 1 to 1,000; pass `next_offset` as `offset` to continue. `total_points` describes the whole activity. Empty sensor arrays remain empty and appear in `unavailable_streams`; missing readings are never filled with zeros.
+
+Activity detail timestamps use Unix milliseconds, while verified stream timestamps use Unix seconds. Values and sampling intervals are preserved, including zero readings, duplicate timestamps and gaps. Other stream units are not normalized. A sample mean, or a mean excluding zero cadence, need not match the app's aggregate. A zero cadence summary does not prove the stream has no cadence. `get_activity` preserves the upstream summary instead of replacing it with a calculated value.
+
+The live API exposes both `/activities/` and `/workout/` paths. This service uses `/activities/{id}/stream/`. Its POST request reads data with existing `read` authorization; it does not upload or modify an activity. Each page fetches the complete upstream response, capped at 20,000,000 bytes, then selects fields and slices samples. Lap data and FIT downloads are not provided by this tool.
 
 ## Routes and upload history
 

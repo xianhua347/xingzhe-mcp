@@ -5,7 +5,7 @@ from typing import Any, Literal
 from urllib.parse import urlencode
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from xingzhe_mcp.config import Settings
 from xingzhe_mcp.files import MAX_FILE_BYTES, gpx_bytes
@@ -42,6 +42,31 @@ class ActivityPage(BaseModel):
     count: int
     next_offset: int | None
     results: list[Activity]
+
+
+StreamField = Literal[
+    "timestamp",
+    "location",
+    "cadence",
+    "speed",
+    "distance",
+    "heartrate",
+    "altitude",
+    "power",
+    "temperature",
+    "left_balance",
+    "right_balance",
+]
+
+
+class ActivityStreamPage(BaseModel):
+    activity_id: int
+    total_points: int
+    offset: int
+    next_offset: int | None
+    available_streams: list[str]
+    unavailable_streams: list[str]
+    streams: dict[str, list[JsonValue]]
 
 
 class Route(BaseModel):
@@ -192,14 +217,16 @@ class Xingzhe:
         params: dict[str, int] | None = None,
         *,
         max_bytes: int = 2_000_000,
+        read_via_post: bool = False,
     ) -> httpx.Response:
         token = await self.access_token(subject)
         for attempt in range(2):
             try:
                 async with self.client.stream(
-                    "GET",
+                    "POST" if read_via_post else "GET",
                     f"{BASE_URL}/openapi/v1/{path}",
                     params=params,
+                    json={} if read_via_post else None,
                     headers={"Authorization": f"Bearer {token}"},
                     timeout=15,
                 ) as response:
@@ -341,3 +368,42 @@ class Xingzhe:
             return Activity.model_validate(activity)
         except (KeyError, ValidationError) as exc:
             raise XingzheError("Xingzhe returned invalid activity data.") from exc
+
+    async def get_activity_stream(
+        self,
+        subject: str,
+        activity_id: int,
+        fields: list[StreamField] | None = None,
+        limit: int = 500,
+        offset: int = 0,
+    ) -> ActivityStreamPage:
+        if not 1 <= limit <= 1000 or offset < 0:
+            raise ValueError("limit must be 1–1000 and offset must be nonnegative")
+        # Check ownership before requesting any location or sensor samples.
+        await self.get_activity(subject, activity_id)
+        response = await self.response(
+            subject,
+            f"activities/{activity_id}/stream/",
+            read_via_post=True,
+            max_bytes=20_000_000,
+        )
+        data = self._response(response).get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("timestamp"), list):
+            raise XingzheError("Xingzhe returned invalid activity stream data.")
+        count = len(data["timestamp"])
+        if any(not isinstance(v, list) or len(v) not in (0, count) for v in data.values()):
+            raise XingzheError("Xingzhe returned misaligned activity streams.")
+        selected = list(dict.fromkeys(["timestamp", *(fields if fields is not None else data)]))
+        end = min(offset + limit, count)
+        try:
+            return ActivityStreamPage(
+                activity_id=activity_id,
+                total_points=count,
+                offset=offset,
+                next_offset=end if end < count else None,
+                available_streams=[key for key, values in data.items() if values],
+                unavailable_streams=[key for key in selected if not data.get(key)],
+                streams={key: data.get(key, [])[offset:end] for key in selected},
+            )
+        except ValidationError as exc:
+            raise XingzheError("Xingzhe returned invalid activity stream values.") from exc
