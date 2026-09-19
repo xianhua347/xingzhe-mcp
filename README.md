@@ -8,7 +8,7 @@ Python · FastAPI · MCP · Supabase · Vercel. Managed with [uv](https://docs.a
 
 ## Why this project?
 
-Your rides already live in the mainland China Xingzhe app. This service connects to its official API and exposes two read-only MCP tools. Each deployment belongs to one account, with its own credentials and database storage.
+Your rides already live in the mainland China Xingzhe app. This service connects to its official API and exposes two read-only MCP tools. One deployment supports multiple Xingzhe accounts. Each user authorizes their own account when connecting an MCP client.
 
 | Tool | What it does |
 | --- | --- |
@@ -28,7 +28,7 @@ cp .env.example .env
 
 1. Run the SQL in [`supabase/migrations/`](supabase/migrations/) once in your Supabase SQL editor, or apply it through your existing migration workflow. It creates a private `xingzhe` schema.
 2. Fill in `.env`. Use the **transaction pooler** connection string from Supabase's Connect dialog for `DATABASE_URL`, with `sslmode=require`. Keep the actual pooler host from the dashboard. `POSTGRES_URL` is also accepted, so the Vercel integration can supply it directly.
-3. Generate `ENCRYPTION_KEY`, `ADMIN_KEY`, and `MCP_CLIENT_SECRET` using the commands in [`.env.example`](.env.example). Generate each secret separately and keep the encryption key stable across deployments.
+3. Generate `ENCRYPTION_KEY` and `MCP_CLIENT_SECRET` using the commands in [`.env.example`](.env.example). Generate each secret separately and keep the encryption key stable across deployments.
 4. Set your Xingzhe application's callback to `PUBLIC_URL/oauth/xingzhe/callback`. For local development, that is `http://localhost:8000/oauth/xingzhe/callback`.
 5. Set `MCP_REDIRECT_URIS` to a JSON array of exact callback URLs supplied by your MCP client. These are different from the Xingzhe callback. No wildcards are accepted.
 
@@ -36,7 +36,12 @@ cp .env.example .env
 uv run uvicorn app:app --reload --no-access-log
 ```
 
-Open [localhost:8000/connect](http://localhost:8000/connect), enter `ADMIN_KEY`, and authorize Xingzhe. Then add `PUBLIC_URL/mcp` to your MCP client using `MCP_CLIENT_ID` and `MCP_CLIENT_SECRET`. The authorization page asks for the owner key before granting access to activities.
+Add `PUBLIC_URL/mcp` to your MCP client using `MCP_CLIENT_ID` and `MCP_CLIENT_SECRET`. Connecting opens Xingzhe’s login and authorization page, then returns to your MCP client automatically. Sign in with the same Xingzhe account used in the mobile app. No separate setup page or owner key is required.
+
+```text
+ChatGPT → MCP authorization → Xingzhe login and consent
+        ← MCP authorization code ← verified Xingzhe account
+```
 
 For ChatGPT, use a custom MCP app with OAuth, enter the client credentials above, and copy its exact callback URL into `MCP_REDIRECT_URIS`. Availability and setup are described in [OpenAI's authentication guide](https://developers.openai.com/apps-sdk/build/auth).
 
@@ -52,13 +57,17 @@ MCP uses stateless Streamable HTTP. Authorization state and encrypted tokens liv
 
 ## Access and storage
 
-The service requests only Xingzhe's `read` scope. MCP uses a separate OAuth flow with PKCE, short-lived access tokens, rotating refresh tokens, and explicit owner consent. Xingzhe credentials and tokens are never returned to MCP clients.
+The service requests only Xingzhe's `read` scope. MCP uses a separate OAuth flow with PKCE, short-lived access tokens, rotating refresh tokens, and account-bound authorization. Xingzhe credentials and tokens are never returned to MCP clients.
 
 The private table has RLS enabled and no public policies. It is accessed by the server through PostgreSQL, not Supabase's Data API. Supabase may report an informational “RLS enabled, no policy” notice; denying Data API access is intentional. Keep `xingzhe` out of exposed schemas.
 
-Use `/disconnect` to delete stored authorization and invalidate all MCP grants. Reconnecting also invalidates old grants. To revoke the upstream application's authorization itself, use Xingzhe's account settings. Losing or replacing `ENCRYPTION_KEY` makes existing records unreadable; back it up separately from the database.
+The server verifies your account ID through Xingzhe’s profile API and binds MCP tokens to that identity. Tool arguments cannot select another account. Reconnecting one account does not change another account’s authorization. Multiple users can share a deployment; each MCP connection accesses one authorized Xingzhe account.
+
+`POST /disconnect` with an MCP bearer token deletes that account’s stored Xingzhe tokens and all its MCP grants. Other accounts remain connected. `/revoke` revokes only the presented MCP grant. To revoke the upstream application's authorization itself, use Xingzhe's account settings. Losing or replacing `ENCRYPTION_KEY` makes existing records unreadable; back it up separately from the database.
 
 `GET /health` checks process liveness. `GET /ready` checks configuration and storage. Missing or invalid configuration returns 503 on service routes. REST equivalents are `/api/activities` and `/api/activities/{id}` and require a valid MCP access token. Avoid recording authorization headers or callback query strings in logs.
+
+Upgrading from the single-owner version requires running the new migration. It clears legacy authorization records in `xingzhe.records`; every user must reconnect. Remove the unused `ADMIN_KEY` environment variable.
 
 ## Development
 
@@ -70,7 +79,7 @@ uv run pytest
 uv build
 ```
 
-PostgreSQL integration tests cover OAuth, MCP calls, persistence, encryption, and concurrent token exchange. Set `TEST_DATABASE_URL` to an isolated database whose name ends in `_test`. Tests recreate its `xingzhe` schema. Without that variable, database tests are skipped. CI starts PostgreSQL and runs the full suite. Xingzhe's external API is mocked in tests.
+PostgreSQL integration tests cover the chained OAuth flow, concurrent multi-account MCP calls, account isolation, revocation, persistence, encryption, and concurrent token exchange. Set `TEST_DATABASE_URL` to an isolated database whose name ends in `_test`. Tests recreate its `xingzhe` schema. Without that variable, database tests are skipped. CI starts PostgreSQL and runs the full suite. Xingzhe's external API is mocked in tests.
 
 Application code lives in [`src/xingzhe_mcp/`](src/xingzhe_mcp/). Add dependencies with `uv add` and commit `uv.lock` with `pyproject.toml`.
 

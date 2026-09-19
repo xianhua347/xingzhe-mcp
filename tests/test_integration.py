@@ -39,6 +39,8 @@ def upstream(request: httpx.Request) -> httpx.Response:
             },
         )
     assert request.headers["authorization"] == "Bearer upstream-access"
+    if request.url.path == "/openapi/v1/athlete/info/":
+        return httpx.Response(200, json={"id": 123})
     if request.url.path == "/openapi/v1/activities/":
         assert request.url.params.get("limit") in ("1", "20")
         return httpx.Response(
@@ -54,42 +56,21 @@ def upstream(request: httpx.Request) -> httpx.Response:
             200,
             json={
                 "code": 0,
-                "data": {"id": 42, "duration": 1800, "avg_cadence": 82, "max_cadence": 106},
+                "data": {
+                    "id": 42,
+                    "user_id": 123,
+                    "duration": 1800,
+                    "avg_cadence": 82,
+                    "max_cadence": 106,
+                },
             },
         )
     raise AssertionError(f"Unexpected upstream path: {request.url.path}")
 
 
-async def form(
-    client: httpx.AsyncClient, path: str, settings: Settings, **values: str
-) -> httpx.Response:
-    page = await client.get(path)
-    assert page.status_code == 200, page.text
-    assert page.headers["referrer-policy"] == "same-origin"
-    return await client.post(
-        urlsplit(path).path,
-        headers={"Origin": settings.origin},
-        data={
-            "csrf": client.cookies["xingzhe_csrf"],
-            "admin_key": settings.admin_key.get_secret_value(),
-            **values,
-        },
-    )
-
-
-async def connect(client: httpx.AsyncClient, settings: Settings) -> None:
-    redirect = await form(client, "/connect", settings)
-    assert redirect.status_code == 303
-    state = parse_qs(urlsplit(redirect.headers["location"]).query)["state"][0]
-    invalid = await client.get("/oauth/xingzhe/callback", params={"state": "wrong", "code": "code"})
-    assert invalid.status_code == 400
-    result = await client.get("/oauth/xingzhe/callback", params={"state": state, "code": "code"})
-    assert result.status_code == 200, result.text
-    replay = await client.get("/oauth/xingzhe/callback", params={"state": state, "code": "code"})
-    assert replay.status_code == 400
-
-
-async def authorize(client: httpx.AsyncClient, settings: Settings) -> dict[str, str]:
+async def authorize(
+    client: httpx.AsyncClient, settings: Settings, code: str = "code"
+) -> dict[str, str]:
     redirect_uri = str(settings.mcp_redirect_uris[0])
     response = await client.get(
         "/authorize",
@@ -105,12 +86,16 @@ async def authorize(client: httpx.AsyncClient, settings: Settings) -> dict[str, 
         },
     )
     assert response.status_code == 302, response.text
-    consent_url = response.headers["location"]
-    ticket = parse_qs(urlsplit(consent_url).query)["ticket"][0]
-    approval = await form(client, consent_url, settings, ticket=ticket)
+    redirect = await client.get(response.headers["location"])
+    assert redirect.status_code == 303
+    state = parse_qs(urlsplit(redirect.headers["location"]).query)["state"][0]
+    assert urlsplit(redirect.headers["location"]).hostname == "www.imxingzhe.com"
+    approval = await client.get("/oauth/xingzhe/callback", params={"state": state, "code": code})
     assert approval.status_code == 303, approval.text
     query = parse_qs(urlsplit(approval.headers["location"]).query)
     assert query["state"] == ["client-state"]
+    replay = await client.get("/oauth/xingzhe/callback", params={"state": state, "code": code})
+    assert replay.status_code == 400
     return {
         "grant_type": "authorization_code",
         "code": query["code"][0],
@@ -144,7 +129,6 @@ def test_oauth_mcp_end_to_end(settings: Settings) -> None:
             assert resource["resource"] == settings.resource
             assert (await client.post("/mcp", json={})).status_code == 401
             assert (await client.get("/api/activities")).status_code == 401
-            await connect(client, settings)
             exchange = await authorize(client, settings)
             assert (
                 await client.post("/token", data={**exchange, "code_verifier": "bad"})
@@ -222,8 +206,8 @@ def test_oauth_mcp_end_to_end(settings: Settings) -> None:
             assert renewed.status_code == 200, renewed.text
             assert (await client.post("/token", data=refresh_data)).status_code == 400
             assert (await client.get("/api/activities", headers=headers)).status_code == 401
-            await form(client, "/disconnect", settings)
             new_headers = {"Authorization": f"Bearer {renewed.json()['access_token']}"}
+            assert (await client.post("/disconnect", headers=new_headers)).status_code == 200
             assert (await client.get("/api/activities", headers=new_headers)).status_code == 401
 
     asyncio.run(run())
@@ -239,28 +223,8 @@ def test_browser_and_client_boundaries(settings: Settings) -> None:
                 base_url=settings.origin,
             ) as client,
         ):
-            assert (
-                await client.post(
-                    "/connect", data={"admin_key": settings.admin_key.get_secret_value()}
-                )
-            ).status_code == 403
-            await client.get("/connect")
-            for origin in ("null", "https://evil.test"):
-                rejected = await client.post(
-                    "/connect",
-                    headers={"Origin": origin},
-                    data={
-                        "csrf": client.cookies["xingzhe_csrf"],
-                        "admin_key": settings.admin_key.get_secret_value(),
-                    },
-                )
-                assert rejected.status_code == 403
-                assert rejected.json()["detail"] == "Invalid form origin"
-            assert (
-                await client.post(
-                    "/connect", data={"csrf": client.cookies["xingzhe_csrf"], "admin_key": "wrong"}
-                )
-            ).status_code == 403
+            assert (await client.post("/disconnect")).status_code == 401
+            assert (await client.get("/connect", params={"ticket": "wrong"})).status_code == 400
             bad = await client.get(
                 "/authorize",
                 params={
@@ -273,9 +237,29 @@ def test_browser_and_client_boundaries(settings: Settings) -> None:
             )
             assert bad.status_code == 400
             assert "location" not in bad.headers
-            redirect = await form(client, "/connect", settings)
+            response = await client.get(
+                "/authorize",
+                params={
+                    "response_type": "code",
+                    "client_id": settings.mcp_client_id,
+                    "redirect_uri": str(settings.mcp_redirect_uris[0]),
+                    "code_challenge": CHALLENGE,
+                    "code_challenge_method": "S256",
+                },
+            )
+            redirect = await client.get(response.headers["location"])
             state = parse_qs(urlsplit(redirect.headers["location"]).query)["state"][0]
-            client.cookies.delete("xingzhe_oauth")
+            saved_cookies = httpx.Cookies(client.cookies)
+            client.cookies.clear()
+            assert (
+                await client.get("/oauth/xingzhe/callback", params={"state": state, "code": "code"})
+            ).status_code == 400
+            client.cookies.update(saved_cookies)
+            assert (
+                await client.get(
+                    "/oauth/xingzhe/callback", params={"state": state, "error": "access_denied"}
+                )
+            ).status_code == 400
             assert (
                 await client.get("/oauth/xingzhe/callback", params={"state": state, "code": "code"})
             ).status_code == 400
@@ -302,7 +286,15 @@ def test_atomic_code_exchange_and_encryption(settings: Settings) -> None:
             ),
         )
         ticket = parse_qs(urlsplit(consent).query)["ticket"][0]
-        redirect = await provider.approve(ticket)
+        redirect = await provider.approve(
+            ticket,
+            "xingzhe:123",
+            Tokens(
+                access_token="upstream-access",
+                refresh_token="upstream-refresh",
+                expires_at=time.time() + 3600,
+            ),
+        )
         code = parse_qs(urlsplit(redirect).query)["code"][0]
         loaded = await provider.load_authorization_code(client, code)
         assert loaded is not None
@@ -340,14 +332,16 @@ def test_concurrent_upstream_refresh(settings: Settings) -> None:
         async with store.transaction("connection") as tx:
             await tx.put(
                 "connection",
-                "owner",
+                "xingzhe:123",
                 Tokens(
                     access_token="expired", refresh_token="old-refresh", expires_at=time.time() - 1
                 ).model_dump(),
             )
         async with httpx.AsyncClient(transport=httpx.MockTransport(refresh)) as client:
             xingzhe = Xingzhe(settings, store, client)
-            results = await asyncio.gather(xingzhe.access_token(), xingzhe.access_token())
+            results = await asyncio.gather(
+                xingzhe.access_token("xingzhe:123"), xingzhe.access_token("xingzhe:123")
+            )
             assert all(token == "upstream-access" for token in results)
             assert calls == 1
 
@@ -370,3 +364,112 @@ def test_upstream_errors_are_sanitized(status: int, body: Any, expected: int) ->
         Xingzhe._response(httpx.Response(status, json=body))
     assert raised.value.status == expected
     assert "must not leak" not in str(raised.value)
+
+
+def test_accounts_are_isolated(settings: Settings) -> None:
+    def accounts(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oauth2/v2/access_token/":
+            account = 2 if b"account-two" in request.content else 1
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": f"account-{account}",
+                    "refresh_token": f"refresh-{account}",
+                    "expires_in": 3600,
+                },
+            )
+        account = int(request.headers["authorization"].removeprefix("Bearer account-"))
+        if request.url.path == "/openapi/v1/athlete/info/":
+            return httpx.Response(200, json={"code": 200, "data": {"id": account}, "msg": "OK"})
+        if request.url.path == "/openapi/v1/activities/":
+            return httpx.Response(200, json={"count": 1, "results": [{"id": account * 100}]})
+        if request.url.path == "/openapi/v1/activities/200/":
+            # Upstream might expose a public ride belonging to another account.
+            return httpx.Response(200, json={"data": {"id": 200, "user_id": 2}})
+        raise AssertionError(request.url.path)
+
+    async def run() -> None:
+        app = create_app(settings, transport=httpx.MockTransport(accounts))
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url=settings.origin,
+            ) as first,
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url=settings.origin,
+            ) as second,
+        ):
+            tokens = []
+            for client, code in ((first, "account-one"), (second, "account-two")):
+                exchange = await authorize(client, settings, code)
+                result = await client.post("/token", data=exchange)
+                assert result.status_code == 200
+                tokens.append(result.json())
+            headers = [
+                {
+                    "Authorization": f"Bearer {t['access_token']}",
+                    "Accept": "application/json, text/event-stream",
+                }
+                for t in tokens
+            ]
+
+            async def ride_ids() -> list[int]:
+                responses = await asyncio.gather(
+                    *[
+                        first.post(
+                            "/mcp",
+                            headers=h,
+                            json={
+                                "jsonrpc": "2.0",
+                                "id": index,
+                                "method": "tools/call",
+                                "params": {"name": "list_activities", "arguments": {}},
+                            },
+                        )
+                        for index, h in enumerate(headers)
+                    ]
+                )
+                return [
+                    r.json()["result"]["structuredContent"]["results"][0]["id"] for r in responses
+                ]
+
+            assert await ride_ids() == [100, 200]
+            assert (await first.get("/api/activities/200", headers=headers[0])).status_code == 403
+            assert (await second.get("/api/activities/200", headers=headers[1])).status_code == 200
+            # Reauthorizing A preserves B and cannot rebind an existing A token to B.
+            await authorize(first, settings, "account-one")
+            assert await ride_ids() == [100, 200]
+            refresh = {
+                "grant_type": "refresh_token",
+                "refresh_token": tokens[0]["refresh_token"],
+                "client_id": settings.mcp_client_id,
+                "client_secret": settings.mcp_client_secret.get_secret_value(),
+            }
+            renewed = await first.post("/token", data=refresh)
+            assert renewed.status_code == 200
+            headers[0]["Authorization"] = f"Bearer {renewed.json()['access_token']}"
+            assert await ride_ids() == [100, 200]
+            assert (await first.post("/disconnect", headers=headers[0])).status_code == 200
+            assert (await first.get("/api/activities", headers=headers[0])).status_code == 401
+            assert (await second.get("/api/activities", headers=headers[1])).json()["results"][0][
+                "id"
+            ] == 200
+            refresh["refresh_token"] = renewed.json()["refresh_token"]
+            assert (await first.post("/token", data=refresh)).status_code == 400
+            exchange = await authorize(first, settings, "account-one")
+            assert (await first.post("/token", data=exchange)).status_code == 200
+            assert (await first.get("/api/activities", headers=headers[0])).status_code == 401
+            revoked = await second.post(
+                "/revoke",
+                data={
+                    "client_id": settings.mcp_client_id,
+                    "client_secret": settings.mcp_client_secret.get_secret_value(),
+                    "token": tokens[1]["access_token"],
+                },
+            )
+            assert revoked.status_code == 200
+            assert (await second.get("/api/activities", headers=headers[1])).status_code == 401
+
+    asyncio.run(run())

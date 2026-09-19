@@ -25,7 +25,6 @@ def settings() -> Settings:
             "public_url": "http://localhost:8000",
             "DATABASE_URL": database_url,
             "encryption_key": Fernet.generate_key().decode(),
-            "admin_key": "a" * 40,
             "xingzhe_client_id": "test-xingzhe",
             "xingzhe_client_secret": "test-upstream-secret",
             "mcp_client_secret": "b" * 40,

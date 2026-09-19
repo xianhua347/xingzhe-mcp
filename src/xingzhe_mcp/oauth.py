@@ -1,4 +1,4 @@
-"""Single-owner OAuth provider for MCP; protocol handling is supplied by the MCP SDK."""
+"""Account-bound OAuth provider for MCP; protocol handling is supplied by the MCP SDK."""
 
 import secrets
 import time
@@ -18,6 +18,7 @@ from pydantic import AnyUrl
 
 from xingzhe_mcp.config import Settings
 from xingzhe_mcp.storage import Store, Transaction
+from xingzhe_mcp.xingzhe import Tokens
 
 SCOPE = "activities:read"
 
@@ -56,14 +57,16 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
             await tx.put(
                 "consent", ticket, params.model_dump(mode="json"), expires_at=time.time() + 600
             )
-        return f"{self.settings.origin}/consent?ticket={ticket}"
+        return f"{self.settings.origin}/connect?ticket={ticket}"
 
-    async def approve(self, ticket: str) -> str:
+    async def approve(self, ticket: str, subject: str, tokens: Tokens) -> str:
         async with self.store.transaction() as tx:
             data = await tx.get("consent", ticket)
             if data is None:
                 raise ValueError("Consent expired. Start again from your MCP client.")
             params = AuthorizationParams.model_validate(data)
+            await tx.lock(f"connection:{subject}")
+            await tx.put("connection", subject, tokens.model_dump(), subject=subject)
             code = AuthorizationCode(
                 code=secrets.token_urlsafe(32),
                 scopes=[SCOPE],
@@ -73,11 +76,15 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
                 redirect_uri=params.redirect_uri,
                 redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
                 resource=self.settings.resource,
-                subject="owner",
+                subject=subject,
             )
             await tx.delete("consent", ticket)
             await tx.put(
-                "code", code.code, code.model_dump(mode="json"), expires_at=code.expires_at
+                "code",
+                code.code,
+                code.model_dump(mode="json"),
+                expires_at=code.expires_at,
+                subject=subject,
             )
             return construct_redirect_uri(
                 str(params.redirect_uri), code=code.code, state=params.state
@@ -92,7 +99,9 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
             data = await tx.get("code", authorization_code)
         return AuthorizationCode.model_validate(data) if data else None
 
-    async def _issue(self, tx: Transaction, scopes: list[str], grant_id: str) -> OAuthToken:
+    async def _issue(
+        self, tx: Transaction, scopes: list[str], grant_id: str, subject: str
+    ) -> OAuthToken:
         now = int(time.time())
         access = AccessToken(
             token=secrets.token_urlsafe(32),
@@ -100,7 +109,7 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
             scopes=scopes,
             expires_at=now + 3600,
             resource=self.settings.resource,
-            subject="owner",
+            subject=subject,
         )
         refresh = RefreshToken(
             token=secrets.token_urlsafe(32),
@@ -108,7 +117,7 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
             scopes=scopes,
             expires_at=now + 30 * 86400,
             resource=self.settings.resource,
-            subject="owner",
+            subject=subject,
         )
         for kind, token in (("access", access), ("refresh", refresh)):
             await tx.put(
@@ -117,6 +126,7 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
                 {**token.model_dump(), "grant_id": grant_id},
                 expires_at=token.expires_at,
                 grant_id=grant_id,
+                subject=subject,
             )
         return OAuthToken(
             access_token=access.token,
@@ -133,9 +143,11 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
     ) -> OAuthToken:
         async with self.store.transaction() as tx:
             data = await tx.get("code", authorization_code.code)
-            if data is not None and data["client_id"] == client.client_id:
+            if data is not None and data["client_id"] == client.client_id and data.get("subject"):
                 await tx.delete("code", authorization_code.code)
-                return await self._issue(tx, authorization_code.scopes, secrets.token_urlsafe(24))
+                return await self._issue(
+                    tx, authorization_code.scopes, secrets.token_urlsafe(24), data["subject"]
+                )
         # SDK errors are frozen dataclasses; raise outside generator context managers.
         raise TokenError("invalid_grant", "Code expired or already used")
 
@@ -156,19 +168,22 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
     ) -> OAuthToken:
         async with self.store.transaction() as tx:
             data = await tx.get("refresh", refresh_token.token)
-            if data is not None and data["client_id"] == client.client_id:
+            if data is not None and data["client_id"] == client.client_id and data.get("subject"):
                 await tx.revoke(data["grant_id"])
-                return await self._issue(tx, scopes, data["grant_id"])
+                return await self._issue(tx, scopes, data["grant_id"], data["subject"])
         raise TokenError("invalid_grant", "Refresh token expired or already used")
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         async with self.store.transaction() as tx:
             data = await tx.get("access", token)
-        if not data or data["resource"] != self.settings.resource:
+        if not data or not data.get("subject") or data["resource"] != self.settings.resource:
             return None
         if data["client_id"] != self.settings.mcp_client_id:
             return None
-        return AccessToken.model_validate(data)
+        access = AccessToken.model_validate(data)
+        if access.expires_at is None or access.expires_at <= time.time():
+            return None
+        return access
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         kind = "access" if isinstance(token, AccessToken) else "refresh"

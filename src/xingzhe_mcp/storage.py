@@ -19,6 +19,11 @@ class Transaction:
         self.connection = connection
         self.cipher = cipher
 
+    async def lock(self, name: str) -> None:
+        await self.connection.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"xingzhe:{name}",)
+        )
+
     async def get(self, kind: str, key: str) -> dict[str, Any] | None:
         cursor = await self.connection.execute(
             "SELECT payload FROM xingzhe.records WHERE kind = %s AND key_hash = %s "
@@ -39,18 +44,22 @@ class Transaction:
         *,
         expires_at: float | None = None,
         grant_id: str | None = None,
+        subject: str | None = None,
     ) -> None:
         await self.connection.execute(
-            "INSERT INTO xingzhe.records (kind, key_hash, payload, expires_at, grant_id) "
-            "VALUES (%s, %s, %s, to_timestamp(%s), %s) "
+            "INSERT INTO xingzhe.records "
+            "(kind, key_hash, payload, expires_at, grant_id, subject_hash) "
+            "VALUES (%s, %s, %s, to_timestamp(%s), %s, %s) "
             "ON CONFLICT (kind, key_hash) DO UPDATE SET payload = EXCLUDED.payload, "
-            "expires_at = EXCLUDED.expires_at, grant_id = EXCLUDED.grant_id",
+            "expires_at = EXCLUDED.expires_at, grant_id = EXCLUDED.grant_id, "
+            "subject_hash = EXCLUDED.subject_hash",
             (
                 kind,
                 digest(key),
                 self.cipher.encrypt(json.dumps(value).encode()),
                 expires_at,
                 grant_id,
+                digest(subject) if subject else None,
             ),
         )
         await self.connection.execute("DELETE FROM xingzhe.records WHERE expires_at < now()")
@@ -65,8 +74,10 @@ class Transaction:
             "DELETE FROM xingzhe.records WHERE grant_id = %s", (grant_id,)
         )
 
-    async def disconnect(self) -> None:
-        await self.connection.execute("DELETE FROM xingzhe.records")
+    async def disconnect(self, subject: str) -> None:
+        await self.connection.execute(
+            "DELETE FROM xingzhe.records WHERE subject_hash = %s", (digest(subject),)
+        )
 
 
 class Store:
@@ -83,7 +94,6 @@ class Store:
             await connection.execute("SET LOCAL lock_timeout = '20s'")
             await connection.execute("SET LOCAL statement_timeout = '25s'")
             # Transaction locks work across processes and Vercel instances, including absent rows.
-            await connection.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"xingzhe:{lock}",)
-            )
-            yield Transaction(connection, self.cipher)
+            transaction = Transaction(connection, self.cipher)
+            await transaction.lock(lock)
+            yield transaction

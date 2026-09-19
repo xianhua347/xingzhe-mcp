@@ -4,7 +4,6 @@ import secrets
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from html import escape
 from typing import Annotated, Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -12,6 +11,7 @@ import httpx
 from cryptography.fernet import InvalidToken
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
@@ -53,7 +53,7 @@ def create_app(
     provider = OAuthProvider(config, store)
     mcp: FastMCP[Any] = FastMCP(
         "Xingzhe",
-        instructions="Read the owner's mainland Xingzhe activities. "
+        instructions="Read the authenticated user's mainland Xingzhe activities. "
         "Dates use Unix milliseconds. Distance is meters; duration is seconds. "
         "Do not infer missing sensor measurements or undocumented units.",
         stateless_http=True,
@@ -78,6 +78,12 @@ def create_app(
         readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
     )
 
+    def mcp_subject() -> str:
+        access = get_access_token()
+        if access is None or not access.subject:
+            raise ToolError("Authentication is required. Reconnect your MCP client.")
+        return access.subject
+
     @mcp.tool(annotations=annotations)
     async def list_activities(
         limit: Annotated[int, Query(ge=1, le=100)] = 20,
@@ -87,7 +93,9 @@ def create_app(
     ) -> ActivityPage:
         """List activities between Unix millisecond timestamps; page with next_offset."""
         try:
-            return await xingzhe.list_activities(limit, offset, start_timestamp, end_timestamp)
+            return await xingzhe.list_activities(
+                mcp_subject(), limit, offset, start_timestamp, end_timestamp
+            )
         except (XingzheError, ValueError) as exc:
             raise ToolError(str(exc)) from None
         except (DatabaseError, InvalidToken):
@@ -99,7 +107,7 @@ def create_app(
     async def get_activity(activity_id: Annotated[int, Query(gt=0)]) -> Activity:
         """Get activity details including cadence, heart rate and power when supplied by Xingzhe."""
         try:
-            return await xingzhe.get_activity(activity_id)
+            return await xingzhe.get_activity(mcp_subject(), activity_id)
         except (XingzheError, ValueError) as exc:
             raise ToolError(str(exc)) from None
         except (DatabaseError, InvalidToken):
@@ -151,51 +159,6 @@ def create_app(
     app.add_exception_handler(DatabaseError, storage_error)
     app.add_exception_handler(InvalidToken, storage_error)
 
-    def form_page(title: str, action: str, *, hidden: dict[str, str] | None = None) -> HTMLResponse:
-        csrf = secrets.token_urlsafe(32)
-        fields = {"csrf": csrf, **(hidden or {})}
-        inputs = "".join(
-            f'<input type="hidden" name="{escape(k)}" value="{escape(v)}">'
-            for k, v in fields.items()
-        )
-        response = HTMLResponse(
-            '<!doctype html><html lang="en"><meta charset="utf-8">'
-            '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            f"<title>{escape(title)}</title><h1>{escape(title)}</h1>"
-            "<p>This deployment connects one Xingzhe account. Enter the service owner key.</p>"
-            f'<form method="post" action="{escape(action)}">{inputs}'
-            '<label>Owner key <input name="admin_key" type="password" required '
-            'autocomplete="current-password"></label> '
-            '<button type="submit">Continue</button></form></html>',
-            # no-referrer makes browsers send Origin: null on native form submissions.
-            # Preserve the same-origin POST origin without disclosing URLs across origins.
-            headers={"Referrer-Policy": "same-origin"},
-        )
-        response.set_cookie(
-            "xingzhe_csrf",
-            csrf,
-            httponly=True,
-            secure=config.public_url.scheme == "https",
-            samesite="lax",
-            max_age=600,
-        )
-        return response
-
-    async def owner_form(request: Request) -> dict[str, str]:
-        form = await request.form()
-        values = {key: str(value) for key, value in form.items()}
-        csrf = values.get("csrf", "")
-        cookie = request.cookies.get("xingzhe_csrf", "")
-        if request.headers.get("origin") not in (None, config.origin):
-            raise HTTPException(403, "Invalid form origin")
-        if not csrf or not cookie or not secrets.compare_digest(csrf, cookie):
-            raise HTTPException(403, "Form expired. Reload the page.")
-        if not secrets.compare_digest(
-            values.get("admin_key", ""), config.admin_key.get_secret_value()
-        ):
-            raise HTTPException(403, "Invalid owner key")
-        return values
-
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -203,42 +166,46 @@ def create_app(
     @app.get("/ready")
     async def ready() -> dict[str, str]:
         async with store.transaction() as tx:
-            await tx.get("connection", "owner")
+            await tx.get("connection", "health-check")
         return {"status": "ok"}
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
         return (
-            '<h1>Xingzhe MCP</h1><p><a href="/connect">Connect Xingzhe</a> · '
-            '<a href="/disconnect">Disconnect and revoke MCP access</a></p>'
+            "<h1>Xingzhe MCP</h1><p>Add this service's /mcp URL to your MCP client "
+            "with OAuth. You will be redirected to Xingzhe to authorize your account.</p>"
         )
 
     @app.get("/connect")
-    async def connect_form() -> HTMLResponse:
-        return form_page("Connect Xingzhe", "/connect")
-
-    @app.post("/connect")
-    async def connect(request: Request) -> RedirectResponse:
-        await owner_form(request)
+    async def connect(ticket: str) -> RedirectResponse:
         state, browser = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         async with store.transaction() as tx:
-            await tx.put("state", state, {"browser": digest(browser)}, expires_at=time.time() + 600)
+            if await tx.get("consent", ticket) is None:
+                raise HTTPException(400, "Authorization expired. Start again from your MCP client.")
+            await tx.put(
+                "state",
+                state,
+                {"browser": digest(browser), "ticket": ticket},
+                expires_at=time.time() + 600,
+            )
         response = RedirectResponse(xingzhe.authorization_url(state), status_code=303)
         response.set_cookie(
-            "xingzhe_oauth",
+            f"xingzhe_oauth_{digest(state)[:16]}",
             browser,
             httponly=True,
             secure=config.public_url.scheme == "https",
             samesite="lax",
             max_age=600,
+            path="/oauth/xingzhe/callback",
         )
         return response
 
     @app.get("/oauth/xingzhe/callback")
-    async def callback(request: Request, state: str, code: str | None = None) -> HTMLResponse:
+    async def callback(request: Request, state: str, code: str | None = None) -> RedirectResponse:
+        cookie_name = f"xingzhe_oauth_{digest(state)[:16]}"
         async with store.transaction() as tx:
             data = await tx.get("state", state)
-            browser = request.cookies.get("xingzhe_oauth", "")
+            browser = request.cookies.get(cookie_name, "")
             if (
                 not data
                 or not browser
@@ -247,59 +214,25 @@ def create_app(
                 raise HTTPException(400, "Invalid or expired OAuth state")
             await tx.delete("state", state)
         if not code:
-            raise HTTPException(400, "Xingzhe authorization was not granted")
+            async with store.transaction() as tx:
+                await tx.delete("consent", data["ticket"])
+            raise HTTPException(
+                400, "Xingzhe authorization was not granted. Restart from your MCP client."
+            )
         tokens = await xingzhe.exchange({"grant_type": "authorization_code", "code": code})
-        # Reconnection invalidates prior grants so clients cannot silently switch owners.
-        async with store.transaction() as tx:
-            async with store.transaction("connection"):
-                await tx.disconnect()
-                await tx.put("connection", "owner", tokens.model_dump())
-        response = HTMLResponse("<h1>Xingzhe connected</h1><p>Now authorize your MCP client.</p>")
-        response.delete_cookie("xingzhe_oauth")
-        return response
-
-    @app.get("/consent")
-    async def consent(ticket: str) -> HTMLResponse:
-        async with store.transaction() as tx:
-            data = await tx.get("consent", ticket)
-        if data is None:
-            raise HTTPException(400, "Consent expired")
-        return form_page(
-            "Allow your MCP client to read Xingzhe activities",
-            "/consent",
-            hidden={"ticket": ticket},
-        )
-
-    @app.post("/consent")
-    async def approve(request: Request) -> RedirectResponse:
-        values = await owner_form(request)
-        async with store.transaction("connection") as tx:
-            if await tx.get("connection", "owner") is None:
-                raise HTTPException(
-                    409, "Connect Xingzhe at /connect first, then retry authorization"
-                )
+        subject = await xingzhe.account_id(tokens.access_token)
         try:
-            redirect = await provider.approve(values.get("ticket", ""))
+            redirect = await provider.approve(data["ticket"], subject, tokens)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
-        return RedirectResponse(redirect, status_code=303)
+        response = RedirectResponse(redirect, status_code=303)
+        response.delete_cookie(cookie_name, path="/oauth/xingzhe/callback")
+        return response
 
-    @app.get("/disconnect")
-    async def disconnect_form() -> HTMLResponse:
-        return form_page("Delete stored Xingzhe tokens and revoke all MCP access", "/disconnect")
-
-    @app.post("/disconnect")
-    async def disconnect(request: Request) -> dict[str, str]:
-        await owner_form(request)
-        async with store.transaction() as tx:
-            async with store.transaction("connection"):
-                await tx.disconnect()
-        return {"status": "disconnected"}
-
-    async def require_access(request: Request) -> None:
+    async def require_access(request: Request) -> str:
         scheme, _, token = request.headers.get("authorization", "").partition(" ")
         access = await provider.load_access_token(token) if scheme.lower() == "bearer" else None
-        if not access or SCOPE not in access.scopes:
+        if not access or not access.subject or SCOPE not in access.scopes:
             raise HTTPException(
                 401,
                 "A valid MCP access token is required",
@@ -311,23 +244,37 @@ def create_app(
                 },
             )
 
-    @app.get("/api/activities", dependencies=[Depends(require_access)])
+        return access.subject
+
+    @app.post("/disconnect")
+    async def disconnect(subject: Annotated[str, Depends(require_access)]) -> dict[str, str]:
+        async with store.transaction() as tx:
+            await tx.lock(f"connection:{subject}")
+            await tx.disconnect(subject)
+        return {"status": "disconnected"}
+
+    @app.get("/api/activities")
     async def activities(
+        subject: Annotated[str, Depends(require_access)],
         limit: Annotated[int, Query(ge=1, le=100)] = 20,
         offset: Annotated[int, Query(ge=0)] = 0,
         start_timestamp: Annotated[int | None, Query(ge=0)] = None,
         end_timestamp: Annotated[int | None, Query(ge=0)] = None,
     ) -> ActivityPage:
         try:
-            return await xingzhe.list_activities(limit, offset, start_timestamp, end_timestamp)
+            return await xingzhe.list_activities(
+                subject, limit, offset, start_timestamp, end_timestamp
+            )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
 
-    @app.get("/api/activities/{activity_id}", dependencies=[Depends(require_access)])
-    async def activity(activity_id: int) -> Activity:
+    @app.get("/api/activities/{activity_id}")
+    async def activity(
+        activity_id: int, subject: Annotated[str, Depends(require_access)]
+    ) -> Activity:
         if activity_id <= 0:
             raise HTTPException(422, "activity_id must be positive")
-        return await xingzhe.get_activity(activity_id)
+        return await xingzhe.get_activity(subject, activity_id)
 
     app.mount("/", mcp_app)
     return app

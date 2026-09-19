@@ -99,15 +99,31 @@ class Xingzhe:
             raise XingzheError("Xingzhe authorization expired. Reconnect your account.", 401)
         if response.status_code == 429 or (code == 400 and data.get("msg") == "API Limited"):
             raise XingzheError("Xingzhe rate limit reached. Try again later.", 429)
-        if response.is_error or code not in (0, None):
+        if response.is_error or code not in (0, 200, None):
             raise XingzheError("Xingzhe request failed. Try again later.")
         return data
 
-    async def access_token(self, rejected: str | None = None) -> str:
-        async with self.store.transaction("connection") as tx:
-            data = await tx.get("connection", "owner")
+    async def account_id(self, token: str) -> str:
+        """Resolve identity using the authenticated upstream profile, never client input."""
+        try:
+            response = await self.client.get(
+                f"{BASE_URL}/openapi/v1/athlete/info/",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            data = self._response(response)
+            profile = data.get("data", data)
+            user_id = profile.get("id") if isinstance(profile, dict) else None
+            if type(user_id) is not int or user_id <= 0:
+                raise XingzheError("Xingzhe returned an invalid account identity.")
+            return f"xingzhe:{user_id}"
+        except httpx.HTTPError as exc:
+            raise XingzheError("Cannot verify your Xingzhe account. Try again.") from exc
+
+    async def access_token(self, subject: str, rejected: str | None = None) -> str:
+        async with self.store.transaction(f"connection:{subject}") as tx:
+            data = await tx.get("connection", subject)
             if data is None:
-                raise XingzheError("Connect your Xingzhe account at /connect first.", 409)
+                raise XingzheError("Reconnect your Xingzhe account from your MCP client.", 409)
             tokens = Tokens.model_validate(data)
             if tokens.expires_at < time.time() + 60 or tokens.access_token == rejected:
                 tokens = await self.exchange(
@@ -116,11 +132,13 @@ class Xingzhe:
                         "refresh_token": tokens.refresh_token,
                     }
                 )
-                await tx.put("connection", "owner", tokens.model_dump())
+                await tx.put("connection", subject, tokens.model_dump(), subject=subject)
             return tokens.access_token
 
-    async def request(self, path: str, params: dict[str, int] | None = None) -> dict[str, Any]:
-        token = await self.access_token()
+    async def request(
+        self, subject: str, path: str, params: dict[str, int] | None = None
+    ) -> dict[str, Any]:
+        token = await self.access_token(subject)
         for attempt in range(2):
             try:
                 response = await self.client.get(
@@ -132,13 +150,14 @@ class Xingzhe:
             except XingzheError as exc:
                 if exc.status != 401 or attempt:
                     raise
-                token = await self.access_token(rejected=token)
+                token = await self.access_token(subject, rejected=token)
             except httpx.HTTPError as exc:
                 raise XingzheError("Cannot reach Xingzhe. Try again later.") from exc
         raise AssertionError("Unreachable")
 
     async def list_activities(
         self,
+        subject: str,
         limit: int = 20,
         offset: int = 0,
         start_timestamp: int | None = None,
@@ -156,7 +175,7 @@ class Xingzhe:
             params["start_timestamp"] = start_timestamp
         if end_timestamp is not None:
             params["end_timestamp"] = end_timestamp
-        data = await self.request("activities/", params)
+        data = await self.request(subject, "activities/", params)
         try:
             activities = [Activity.model_validate(item) for item in data["results"]]
             count = int(data["count"])
@@ -169,11 +188,16 @@ class Xingzhe:
         except (KeyError, TypeError, ValueError, ValidationError) as exc:
             raise XingzheError("Xingzhe returned invalid activity data.") from exc
 
-    async def get_activity(self, activity_id: int) -> Activity:
+    async def get_activity(self, subject: str, activity_id: int) -> Activity:
         if activity_id <= 0:
             raise ValueError("activity_id must be positive")
-        data = await self.request(f"activities/{activity_id}/")
+        data = await self.request(subject, f"activities/{activity_id}/")
         try:
-            return Activity.model_validate(data["data"])
+            activity = data["data"]
+            if not isinstance(activity, dict) or type(activity.get("user_id")) is not int:
+                raise XingzheError("Xingzhe returned an activity without a valid owner.")
+            if f"xingzhe:{activity['user_id']}" != subject:
+                raise XingzheError("Activity does not belong to your Xingzhe account.", 403)
+            return Activity.model_validate(activity)
         except (KeyError, ValidationError) as exc:
             raise XingzheError("Xingzhe returned invalid activity data.") from exc

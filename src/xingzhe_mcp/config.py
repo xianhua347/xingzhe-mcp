@@ -1,4 +1,4 @@
-"""Configuration for one owner's self-hosted deployment."""
+"""Configuration for a multi-account deployment."""
 
 from typing import Self
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -14,7 +14,6 @@ class Settings(BaseSettings):
     public_url: AnyHttpUrl
     database_url: SecretStr = Field(validation_alias=AliasChoices("DATABASE_URL", "POSTGRES_URL"))
     encryption_key: SecretStr
-    admin_key: SecretStr = Field(min_length=32)
     xingzhe_client_id: str
     xingzhe_client_secret: SecretStr
     mcp_client_id: str = "xingzhe-mcp"
