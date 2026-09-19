@@ -118,7 +118,12 @@ class Xingzhe:
                 files={key: (None, value) for key, value in fields.items()},
             )
             data = self._response(response)
-            if "write" in scope.split() and "write" not in data.get("scope", scope).split():
+            granted_scope = data.get("scope", scope)
+            if (
+                "write" in scope.split()
+                and isinstance(granted_scope, str)
+                and "write" not in granted_scope.split()
+            ):
                 logger.warning(
                     "Xingzhe did not grant requested write scope during %s",
                     fields.get("grant_type", "unknown"),
@@ -131,7 +136,7 @@ class Xingzhe:
                     access_token=data["access_token"],
                     refresh_token=data.get("refresh_token") or fields.get("refresh_token"),
                     expires_at=float(expiry),
-                    scope=data.get("scope", scope),
+                    scope=granted_scope,
                 )
             )
         except (KeyError, TypeError, ValueError, httpx.HTTPError) as exc:
