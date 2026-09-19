@@ -1,6 +1,7 @@
 """Official Xingzhe OAuth, activities, routes and uploads."""
 
 import hashlib
+import logging
 import time
 from typing import Any, Literal
 from urllib.parse import urlencode
@@ -13,6 +14,7 @@ from xingzhe_mcp.files import MAX_FILE_BYTES, fit_bytes, gpx_bytes
 from xingzhe_mcp.storage import Store
 
 BASE_URL = "https://www.imxingzhe.com"
+logger = logging.getLogger(__name__)
 
 
 class XingzheError(Exception):
@@ -116,6 +118,11 @@ class Xingzhe:
                 files={key: (None, value) for key, value in fields.items()},
             )
             data = self._response(response)
+            if "write" in scope.split() and "write" not in data.get("scope", scope).split():
+                logger.warning(
+                    "Xingzhe did not grant requested write scope during %s",
+                    fields.get("grant_type", "unknown"),
+                )
             expiry = data.get("expires_at")
             if expiry is None:
                 expiry = time.time() + float(data["expires_in"])
