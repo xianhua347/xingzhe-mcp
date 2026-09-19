@@ -65,8 +65,10 @@ async def form(
 ) -> httpx.Response:
     page = await client.get(path)
     assert page.status_code == 200, page.text
+    assert page.headers["referrer-policy"] == "same-origin"
     return await client.post(
         urlsplit(path).path,
+        headers={"Origin": settings.origin},
         data={
             "csrf": client.cookies["xingzhe_csrf"],
             "admin_key": settings.admin_key.get_secret_value(),
@@ -243,6 +245,17 @@ def test_browser_and_client_boundaries(settings: Settings) -> None:
                 )
             ).status_code == 403
             await client.get("/connect")
+            for origin in ("null", "https://evil.test"):
+                rejected = await client.post(
+                    "/connect",
+                    headers={"Origin": origin},
+                    data={
+                        "csrf": client.cookies["xingzhe_csrf"],
+                        "admin_key": settings.admin_key.get_secret_value(),
+                    },
+                )
+                assert rejected.status_code == 403
+                assert rejected.json()["detail"] == "Invalid form origin"
             assert (
                 await client.post(
                     "/connect", data={"csrf": client.cookies["xingzhe_csrf"], "admin_key": "wrong"}

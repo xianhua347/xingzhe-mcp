@@ -133,7 +133,7 @@ def create_app(
                 )
         response = await call_next(request)
         response.headers["Cache-Control"] = "no-store"
-        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Content-Security-Policy"] = (
             "default-src 'none'; frame-ancestors 'none'; "
@@ -166,7 +166,10 @@ def create_app(
             f'<form method="post" action="{escape(action)}">{inputs}'
             '<label>Owner key <input name="admin_key" type="password" required '
             'autocomplete="current-password"></label> '
-            '<button type="submit">Continue</button></form></html>'
+            '<button type="submit">Continue</button></form></html>',
+            # no-referrer makes browsers send Origin: null on native form submissions.
+            # Preserve the same-origin POST origin without disclosing URLs across origins.
+            headers={"Referrer-Policy": "same-origin"},
         )
         response.set_cookie(
             "xingzhe_csrf",
