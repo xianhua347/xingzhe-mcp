@@ -1,13 +1,18 @@
 """Integration tests require an isolated database whose name ends in _test."""
 
+import asyncio
 import os
 from pathlib import Path
 
 import psycopg
 import pytest
 from cryptography.fernet import Fernet
+from mcp.shared.auth import OAuthClientInformationFull
+from pydantic import AnyUrl
 
 from xingzhe_mcp.config import Settings
+from xingzhe_mcp.oauth import OAuthProvider
+from xingzhe_mcp.storage import Store
 
 
 @pytest.fixture
@@ -20,14 +25,29 @@ def settings() -> Settings:
         connection.execute("DROP SCHEMA IF EXISTS xingzhe CASCADE")
         for migration in sorted(Path("supabase/migrations").glob("*.sql")):
             connection.execute(migration.read_text())
-    return Settings.model_validate(
+    settings = Settings.model_validate(
         {
             "public_url": "http://localhost:8000",
             "DATABASE_URL": database_url,
             "encryption_key": Fernet.generate_key().decode(),
             "xingzhe_client_id": "test-xingzhe",
             "xingzhe_client_secret": "test-upstream-secret",
-            "mcp_client_secret": "b" * 40,
-            "mcp_redirect_uris": ["http://localhost:8765/callback"],
         }
     )
+
+    async def register() -> None:
+        provider = OAuthProvider(
+            settings, Store(database_url, settings.encryption_key.get_secret_value())
+        )
+        await provider.register_client(
+            OAuthClientInformationFull(
+                client_id="test-client",
+                client_secret="b" * 40,
+                redirect_uris=[AnyUrl("http://localhost:8765/callback")],
+                scope="activities:read",
+                token_endpoint_auth_method="client_secret_post",
+            )
+        )
+
+    asyncio.run(register())
+    return settings

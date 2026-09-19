@@ -103,6 +103,18 @@ class Xingzhe:
             raise XingzheError("Xingzhe request failed. Try again later.")
         return data
 
+    @staticmethod
+    def profile(data: dict[str, Any]) -> dict[str, str]:
+        profile = data.get("data", data)
+        user_id = profile.get("id") if isinstance(profile, dict) else None
+        if type(user_id) is not int or user_id <= 0:
+            raise XingzheError("Xingzhe returned an invalid account identity.")
+        result = {"id": str(user_id)}
+        name = profile.get("username")
+        if isinstance(name, str) and name.strip():
+            result.update(name=name.strip(), nickname=name.strip())
+        return result
+
     async def account_id(self, token: str) -> str:
         """Resolve identity using the authenticated upstream profile, never client input."""
         try:
@@ -110,14 +122,15 @@ class Xingzhe:
                 f"{BASE_URL}/openapi/v1/athlete/info/",
                 headers={"Authorization": f"Bearer {token}"},
             )
-            data = self._response(response)
-            profile = data.get("data", data)
-            user_id = profile.get("id") if isinstance(profile, dict) else None
-            if type(user_id) is not int or user_id <= 0:
-                raise XingzheError("Xingzhe returned an invalid account identity.")
-            return f"xingzhe:{user_id}"
+            return "xingzhe:" + self.profile(self._response(response))["id"]
         except httpx.HTTPError as exc:
             raise XingzheError("Cannot verify your Xingzhe account. Try again.") from exc
+
+    async def get_profile(self, subject: str) -> dict[str, str]:
+        profile = self.profile(await self.request(subject, "athlete/info/"))
+        if "xingzhe:" + profile["id"] != subject:
+            raise XingzheError("Xingzhe account identity changed. Reconnect your account.", 403)
+        return profile
 
     async def access_token(self, subject: str, rejected: str | None = None) -> str:
         async with self.store.transaction(f"connection:{subject}") as tx:

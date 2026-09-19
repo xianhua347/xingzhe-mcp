@@ -2,6 +2,7 @@
 
 import secrets
 import time
+from urllib.parse import urlsplit
 
 from mcp.server.auth.provider import (
     AccessToken,
@@ -10,11 +11,11 @@ from mcp.server.auth.provider import (
     AuthorizeError,
     OAuthAuthorizationServerProvider,
     RefreshToken,
+    RegistrationError,
     TokenError,
     construct_redirect_uri,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
-from pydantic import AnyUrl
 
 from xingzhe_mcp.config import Settings
 from xingzhe_mcp.storage import Store, Transaction
@@ -29,19 +30,30 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
         self.store = store
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        if client_id != self.settings.mcp_client_id:
-            return None
-        return OAuthClientInformationFull(
-            client_id=client_id,
-            client_secret=self.settings.mcp_client_secret.get_secret_value(),
-            client_name="Xingzhe MCP client",
-            scope=SCOPE,
-            token_endpoint_auth_method="client_secret_post",
-            redirect_uris=[AnyUrl(str(uri)) for uri in self.settings.mcp_redirect_uris],
-        )
+        async with self.store.transaction() as tx:
+            data = await tx.get("client", client_id)
+        return OAuthClientInformationFull.model_validate(data) if data else None
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        raise NotImplementedError("Configure a client and exact redirect URIs in the environment")
+        if not client_info.client_id or not client_info.redirect_uris:
+            raise RegistrationError("invalid_client_metadata", "Client and redirect URI required")
+        for uri in client_info.redirect_uris:
+            parsed = urlsplit(str(uri))
+            if (
+                parsed.username
+                or parsed.password
+                or parsed.fragment
+                or (
+                    parsed.scheme != "https"
+                    and not (
+                        parsed.scheme == "http"
+                        and parsed.hostname in ("localhost", "127.0.0.1", "::1")
+                    )
+                )
+            ):
+                raise RegistrationError("invalid_redirect_uri", "Use HTTPS or a loopback HTTP URI")
+        async with self.store.transaction() as tx:
+            await tx.put("client", client_info.client_id, client_info.model_dump(mode="json"))
 
     async def authorize(
         self, client: OAuthClientInformationFull, params: AuthorizationParams
@@ -55,7 +67,14 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
         ticket = secrets.token_urlsafe(32)
         async with self.store.transaction() as tx:
             await tx.put(
-                "consent", ticket, params.model_dump(mode="json"), expires_at=time.time() + 600
+                "consent",
+                ticket,
+                {
+                    **params.model_dump(mode="json"),
+                    "client_id": client.client_id,
+                    "client_name": client.client_name or "MCP client",
+                },
+                expires_at=time.time() + 600,
             )
         return f"{self.settings.origin}/connect?ticket={ticket}"
 
@@ -71,7 +90,7 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
                 code=secrets.token_urlsafe(32),
                 scopes=[SCOPE],
                 expires_at=time.time() + 300,
-                client_id=self.settings.mcp_client_id,
+                client_id=data["client_id"],
                 code_challenge=params.code_challenge,
                 redirect_uri=params.redirect_uri,
                 redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
@@ -100,12 +119,12 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
         return AuthorizationCode.model_validate(data) if data else None
 
     async def _issue(
-        self, tx: Transaction, scopes: list[str], grant_id: str, subject: str
+        self, tx: Transaction, scopes: list[str], grant_id: str, subject: str, client_id: str
     ) -> OAuthToken:
         now = int(time.time())
         access = AccessToken(
             token=secrets.token_urlsafe(32),
-            client_id=self.settings.mcp_client_id,
+            client_id=client_id,
             scopes=scopes,
             expires_at=now + 3600,
             resource=self.settings.resource,
@@ -146,7 +165,11 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
             if data is not None and data["client_id"] == client.client_id and data.get("subject"):
                 await tx.delete("code", authorization_code.code)
                 return await self._issue(
-                    tx, authorization_code.scopes, secrets.token_urlsafe(24), data["subject"]
+                    tx,
+                    authorization_code.scopes,
+                    secrets.token_urlsafe(24),
+                    data["subject"],
+                    data["client_id"],
                 )
         # SDK errors are frozen dataclasses; raise outside generator context managers.
         raise TokenError("invalid_grant", "Code expired or already used")
@@ -170,15 +193,15 @@ class OAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshT
             data = await tx.get("refresh", refresh_token.token)
             if data is not None and data["client_id"] == client.client_id and data.get("subject"):
                 await tx.revoke(data["grant_id"])
-                return await self._issue(tx, scopes, data["grant_id"], data["subject"])
+                return await self._issue(
+                    tx, scopes, data["grant_id"], data["subject"], data["client_id"]
+                )
         raise TokenError("invalid_grant", "Refresh token expired or already used")
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         async with self.store.transaction() as tx:
             data = await tx.get("access", token)
         if not data or not data.get("subject") or data["resource"] != self.settings.resource:
-            return None
-        if data["client_id"] != self.settings.mcp_client_id:
             return None
         access = AccessToken.model_validate(data)
         if access.expires_at is None or access.expires_at <= time.time():

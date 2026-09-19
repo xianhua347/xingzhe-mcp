@@ -16,9 +16,6 @@ class Settings(BaseSettings):
     encryption_key: SecretStr
     xingzhe_client_id: str
     xingzhe_client_secret: SecretStr
-    mcp_client_id: str = "xingzhe-mcp"
-    mcp_client_secret: SecretStr = Field(min_length=32)
-    mcp_redirect_uris: list[AnyHttpUrl]
 
     @field_validator("database_url")
     @classmethod
@@ -35,13 +32,6 @@ class Settings(BaseSettings):
             raise ValueError("PUBLIC_URL must be an origin without a path or credentials")
         if url.scheme != "https" and url.hostname not in ("localhost", "127.0.0.1"):
             raise ValueError("PUBLIC_URL must use HTTPS outside localhost")
-        if not self.mcp_redirect_uris:
-            raise ValueError("At least one exact MCP redirect URI is required")
-        for redirect in self.mcp_redirect_uris:
-            if redirect.fragment or redirect.username:
-                raise ValueError("Redirect URIs must not contain credentials or fragments")
-            if redirect.scheme != "https" and redirect.host not in ("localhost", "127.0.0.1"):
-                raise ValueError("Redirect URIs must use HTTPS outside localhost")
         Fernet(self.encryption_key.get_secret_value().encode())
         return self
 

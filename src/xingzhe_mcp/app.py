@@ -4,7 +4,8 @@ import secrets
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Annotated, Any
+from html import escape
+from typing import Annotated, Any, NotRequired, TypedDict
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -18,13 +19,24 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from psycopg import Error as DatabaseError
-from pydantic import AnyHttpUrl, ValidationError
+from pydantic import AnyHttpUrl, ConfigDict, Field, RootModel, ValidationError, with_config
 from starlette.middleware.base import RequestResponseEndpoint
 
 from xingzhe_mcp.config import Settings
 from xingzhe_mcp.oauth import SCOPE, OAuthProvider
 from xingzhe_mcp.storage import Store, digest
 from xingzhe_mcp.xingzhe import Activity, ActivityPage, Xingzhe, XingzheError
+
+
+@with_config(ConfigDict(extra="forbid"))
+class Profile(TypedDict):
+    id: Annotated[str, Field(min_length=1, pattern=r"\S")]
+    name: NotRequired[str]
+    nickname: NotRequired[str]
+
+
+class ProfileResult(RootModel[Profile]):
+    pass
 
 
 def create_app(
@@ -65,7 +77,7 @@ def create_app(
             validate_token_resource=True,
             required_scopes=[SCOPE],
             client_registration_options=ClientRegistrationOptions(
-                enabled=False, valid_scopes=[SCOPE], default_scopes=[SCOPE]
+                enabled=True, valid_scopes=[SCOPE], default_scopes=[SCOPE]
             ),
             revocation_options=RevocationOptions(enabled=True),
         ),
@@ -83,6 +95,23 @@ def create_app(
         if access is None or not access.subject:
             raise ToolError("Authentication is required. Reconnect your MCP client.")
         return access.subject
+
+    @mcp.tool(annotations=annotations, meta={"openai/profile": True})
+    async def get_profile() -> ProfileResult:
+        """Return the authenticated Xingzhe account's stable ID and current display name."""
+        try:
+            data = await xingzhe.get_profile(mcp_subject())
+            profile: Profile = {"id": data["id"]}
+            if "name" in data:
+                profile["name"] = data["name"]
+                profile["nickname"] = data["nickname"]
+            return ProfileResult(profile)
+        except (XingzheError, ValueError) as exc:
+            raise ToolError(str(exc)) from None
+        except (DatabaseError, InvalidToken):
+            raise ToolError(
+                "Authorization storage is unavailable. Contact the service owner."
+            ) from None
 
     @mcp.tool(annotations=annotations)
     async def list_activities(
@@ -123,9 +152,6 @@ def create_app(
             yield
 
     app = FastAPI(title="Xingzhe MCP", lifespan=lifespan, docs_url=None, redoc_url=None)
-    callback_origins = " ".join(
-        sorted({f"{uri.scheme}://{urlsplit(str(uri)).netloc}" for uri in config.mcp_redirect_uris})
-    )
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: RequestResponseEndpoint) -> Response:
@@ -144,8 +170,7 @@ def create_app(
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Content-Security-Policy"] = (
-            "default-src 'none'; frame-ancestors 'none'; "
-            f"form-action 'self' https://www.imxingzhe.com {callback_origins}"
+            "default-src 'none'; frame-ancestors 'none'; form-action 'self'"
         )
         return response
 
@@ -176,12 +201,62 @@ def create_app(
             "with OAuth. You will be redirected to Xingzhe to authorize your account.</p>"
         )
 
-    @app.get("/connect")
-    async def connect(ticket: str) -> RedirectResponse:
+    @app.get("/connect", response_class=HTMLResponse)
+    async def consent(ticket: str) -> HTMLResponse:
+        browser = secrets.token_urlsafe(32)
+        async with store.transaction() as tx:
+            data = await tx.get("consent", ticket)
+            if data is None or data.get("started"):
+                raise HTTPException(400, "Authorization expired. Start again from your MCP client.")
+            data["browser"] = digest(browser)
+            await tx.put("consent", ticket, data, expires_at=time.time() + 600)
+        # DCR clients choose their own names. Show the actual callback destination as well.
+        response = HTMLResponse(
+            '<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            "<title>连接行者账户</title><h1>连接行者账户</h1>"
+            f"<p>允许 {escape(data['client_name'])} 读取你的行者昵称和运动记录。</p>"
+            f"<p>授权后返回：<code>{escape(str(data['redirect_uri']))}</code></p>"
+            '<form method="post" action="/connect">'
+            f'<input type="hidden" name="ticket" value="{escape(ticket, quote=True)}">'
+            f'<input type="hidden" name="csrf" value="{browser}">'
+            '<button type="submit">继续前往行者授权 / Continue to Xingzhe</button></form></html>'
+        )
+        response.set_cookie(
+            f"xingzhe_consent_{digest(ticket)[:16]}",
+            browser,
+            httponly=True,
+            secure=config.public_url.scheme == "https",
+            samesite="lax",
+            max_age=600,
+            path="/connect",
+        )
+        return response
+
+    @app.post("/connect")
+    async def connect(request: Request) -> RedirectResponse:
+        if request.headers.get("origin") not in (None, config.origin):
+            raise HTTPException(400, "Invalid form origin")
+        form = await request.form()
+        ticket, csrf = str(form.get("ticket", "")), str(form.get("csrf", ""))
+        cookie_name = f"xingzhe_consent_{digest(ticket)[:16]}"
+        browser_cookie = request.cookies.get(cookie_name, "")
         state, browser = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         async with store.transaction() as tx:
-            if await tx.get("consent", ticket) is None:
-                raise HTTPException(400, "Authorization expired. Start again from your MCP client.")
+            data = await tx.get("consent", ticket)
+            if (
+                not data
+                or data.get("started")
+                or not csrf
+                or not browser_cookie
+                or not secrets.compare_digest(csrf, browser_cookie)
+                or not secrets.compare_digest(data.get("browser", ""), digest(csrf))
+            ):
+                raise HTTPException(
+                    400, "Invalid or expired consent. Restart from your MCP client."
+                )
+            data["started"] = True
+            await tx.put("consent", ticket, data, expires_at=time.time() + 600)
             await tx.put(
                 "state",
                 state,
@@ -189,6 +264,7 @@ def create_app(
                 expires_at=time.time() + 600,
             )
         response = RedirectResponse(xingzhe.authorization_url(state), status_code=303)
+        response.delete_cookie(cookie_name, path="/connect")
         response.set_cookie(
             f"xingzhe_oauth_{digest(state)[:16]}",
             browser,

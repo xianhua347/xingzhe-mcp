@@ -8,10 +8,11 @@ Python · FastAPI · MCP · Supabase · Vercel. Managed with [uv](https://docs.a
 
 ## Why this project?
 
-Your rides already live in the mainland China Xingzhe app. This service connects to its official API and exposes two read-only MCP tools. One deployment supports multiple Xingzhe accounts. Each user authorizes their own account when connecting an MCP client.
+Your rides already live in the mainland China Xingzhe app. This service connects to its official API and exposes read-only MCP tools. One deployment supports multiple Xingzhe accounts. Each user authorizes their own account when connecting an MCP client.
 
 | Tool | What it does |
 | --- | --- |
+| `get_profile` | Returns the authenticated account’s stable ID and current Xingzhe nickname. |
 | `list_activities` | Lists activities with pagination and optional start/end timestamps. |
 | `get_activity` | Returns one activity's details, including sensor summaries supplied by Xingzhe. |
 
@@ -19,7 +20,7 @@ Timestamps used as filters are Unix milliseconds. Distance is in meters and dura
 
 ## Getting started
 
-You need a [Xingzhe developer application](https://www.imxingzhe.com/home/#/settings/api), a Supabase project, and an MCP client that supports OAuth with a configured client ID and secret.
+You need a [Xingzhe developer application](https://www.imxingzhe.com/home/#/settings/api), a Supabase project, and an MCP client that supports OAuth dynamic client registration.
 
 ```sh
 uv sync --locked
@@ -28,22 +29,21 @@ cp .env.example .env
 
 1. Run the SQL in [`supabase/migrations/`](supabase/migrations/) once in your Supabase SQL editor, or apply it through your existing migration workflow. It creates a private `xingzhe` schema.
 2. Fill in `.env`. Use the **transaction pooler** connection string from Supabase's Connect dialog for `DATABASE_URL`, with `sslmode=require`. Keep the actual pooler host from the dashboard. `POSTGRES_URL` is also accepted, so the Vercel integration can supply it directly.
-3. Generate `ENCRYPTION_KEY` and `MCP_CLIENT_SECRET` using the commands in [`.env.example`](.env.example). Generate each secret separately and keep the encryption key stable across deployments.
+3. Generate `ENCRYPTION_KEY` using the commands in [`.env.example`](.env.example). Keep the encryption key stable across deployments.
 4. Set your Xingzhe application's callback to `PUBLIC_URL/oauth/xingzhe/callback`. For local development, that is `http://localhost:8000/oauth/xingzhe/callback`.
-5. Set `MCP_REDIRECT_URIS` to a JSON array of exact callback URLs supplied by your MCP client. These are different from the Xingzhe callback. No wildcards are accepted.
 
 ```sh
 uv run uvicorn app:app --reload --no-access-log
 ```
 
-Add `PUBLIC_URL/mcp` to your MCP client using `MCP_CLIENT_ID` and `MCP_CLIENT_SECRET`. Connecting opens Xingzhe’s login and authorization page, then returns to your MCP client automatically. Sign in with the same Xingzhe account used in the mobile app. No separate setup page or owner key is required.
+Add `PUBLIC_URL/mcp` to your MCP client and choose OAuth. Client registration happens automatically; no client ID, secret, or callback configuration is needed. Confirm the requesting client and return address, authorize in Xingzhe, and you will return to your MCP client. Sign in with the account used in the mobile app.
 
 ```text
 ChatGPT → MCP authorization → Xingzhe login and consent
         ← MCP authorization code ← verified Xingzhe account
 ```
 
-For ChatGPT, use a custom MCP app with OAuth, enter the client credentials above, and copy its exact callback URL into `MCP_REDIRECT_URIS`. Availability and setup are described in [OpenAI's authentication guide](https://developers.openai.com/apps-sdk/build/auth).
+For ChatGPT, create a custom app, enter the MCP URL, leave OAuth selected, and connect without opening advanced OAuth settings. `get_profile` supplies the Xingzhe nickname for account labels using OpenAI's profile-tool metadata. ChatGPT controls when labels refresh and any user-defined nickname overrides. See [OpenAI's authentication guide](https://developers.openai.com/plugins/build/auth).
 
 ## Deploy to Vercel
 
@@ -51,7 +51,7 @@ Import your repository into Vercel with the FastAPI framework preset. [`app.py`]
 
 Connect your Supabase integration to this Vercel project and supply the variables from `.env.example` as server-side environment variables. If the integration supplies `POSTGRES_URL`, omit `DATABASE_URL`. Do not use a Supabase public API key as a database password.
 
-Use a stable HTTPS production domain for `PUBLIC_URL`, update both providers' callback settings, then redeploy. Check `/ready` before connecting Xingzhe. MCP clients must be able to reach the OAuth metadata and `/mcp` without a Vercel login wall. Application OAuth still protects the activity data.
+Use a stable HTTPS production domain for `PUBLIC_URL`, update the Xingzhe application's callback, then redeploy. Check `/ready` before connecting Xingzhe. MCP clients must be able to reach the OAuth metadata and `/mcp` without a Vercel login wall. Application OAuth still protects the activity data.
 
 MCP uses stateless Streamable HTTP. Authorization state and encrypted tokens live in Supabase, so requests do not need to return to the same Vercel instance. Put preview deployments on a separate database and encryption key if you enable OAuth there.
 
@@ -67,7 +67,9 @@ The server verifies your account ID through Xingzhe’s profile API and binds MC
 
 `GET /health` checks process liveness. `GET /ready` checks configuration and storage. Missing or invalid configuration returns 503 on service routes. REST equivalents are `/api/activities` and `/api/activities/{id}` and require a valid MCP access token. Avoid recording authorization headers or callback query strings in logs.
 
-Upgrading from the single-owner version requires running the new migration. It clears legacy authorization records in `xingzhe.records`; every user must reconnect. Remove the unused `ADMIN_KEY` environment variable.
+Apply new migrations before deploying upgrades. Dynamic OAuth clients and their credentials are stored encrypted alongside grants, without automatic expiry. Registration only accepts HTTPS callbacks or HTTP loopback callbacks; each authorization validates an exact registered URI and requires browser-bound consent. Do not delete registered clients while their connections are in use.
+
+When upgrading from environment-configured MCP credentials, reconnect the ChatGPT app using automatic registration, then remove `MCP_CLIENT_ID`, `MCP_CLIENT_SECRET`, and `MCP_REDIRECT_URIS`. The dynamic-client migration preserves existing account data. The earlier single-owner migration clears legacy grants and requires reauthorization.
 
 ## Development
 
